@@ -11,6 +11,85 @@ from q_pixelate.render import Exporter, render_preview
 
 
 class RenderTests(unittest.TestCase):
+    def test_speed_preserves_delayed_audio_on_source_timeline(self):
+        import array
+        source = self.root/'delayed.mp4'
+        command('ffmpeg', '-v', 'error', '-y', '-i', str(self.source), '-itsoffset', '1', '-i', str(self.source),
+                '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy', str(source))
+        out, _ = self.export([Edit(2, 4, 'none', speed=2)], 'delayed-out.mp4', source)
+        samples = array.array('h', command('ffmpeg', '-v', 'error', '-i', str(out), '-map', '0:a:0',
+                                         '-ac', '1', '-ar', '8000', '-f', 's16le', '-'))
+        self.assertLess(max(abs(s) for s in samples[:5600]), 30)
+        self.assertGreater(max(abs(s) for s in samples[9600:10400]), 1000)
+
+    def test_speed_changes_duration_audio_and_preserves_copied_tail(self):
+        out, report = self.export([Edit(2, 4, 'none', speed=2)], 'speed.mp4')
+        info = probe(out, Runner())
+        frames = hashes(out)
+        self.assertEqual(len(frames), 100)
+        self.assertEqual(frames[:40], self.original[:40])
+        self.assertEqual(frames[60:], self.original[80:])
+        self.assertEqual(report.frames, 100)
+        self.assertEqual(len(info.audio), 2)
+        self.assertEqual(info.audio[0]['tags']['language'], 'zho')
+        self.assertAlmostEqual(info.duration, 5, delta=.08)
+        for track in info.audio:
+            self.assertAlmostEqual(float(track['duration']), 5, delta=.08)
+
+    def test_preview_speed_and_multiple_changes_inside_one_gop(self):
+        out, _ = self.export([Edit(2.2, 2.6, 'none', speed=2),
+                              Edit(2.8, 3.2, 'none', speed=.5)], 'mixed-speed.mkv')
+        self.assertEqual(len(hashes(out)), 124)
+        preview = self.root / 'speed-preview.mp4'
+        render_preview(Project(str(self.source), [Edit(1, 2, 'none', speed=2)]), 0, preview, Runner())
+        self.assertEqual(len(hashes(preview)), 10)
+        self.assertAlmostEqual(probe(preview, Runner()).duration, .5, delta=.08)
+
+    def test_shapes_and_feather_mask_pixels(self):
+        from q_pixelate.masks import mask_image
+        edit = Edit(1, 2, 'region', Rect(.25, .25, .5, .5), shape='ellipse')
+        mask = mask_image(edit, 320, 180)
+        self.assertEqual(mask.pixelColor(80, 45).red(), 0)
+        self.assertEqual(mask.pixelColor(160, 90).red(), 255)
+        out, _ = self.export([edit], 'ellipse.mp4')
+        self.assertEqual(len(hashes(out)), 120)
+        edit.shape = 'lasso'
+        edit.points = [(.25, .25), (.75, .25), (.5, .75)]
+        edit.feather = 4
+        out, _ = self.export([edit], 'lasso.mp4')
+        self.assertEqual(len(hashes(out)), 120)
+
+    def test_slow_motion_at_eof_and_fast_fractional_silent_clip(self):
+        out, _ = self.export([Edit(5, 6, 'none', speed=.25)], 'slow-end.mp4')
+        self.assertEqual(len(hashes(out)), 180)
+        self.assertAlmostEqual(probe(out, Runner()).duration, 9, delta=.08)
+        source = fixture(self.root/'speed-fractional.mp4', '30000/1001', False)
+        out, report = self.export([Edit(0, .667, 'none', speed=3)], 'speed-fractional-out.mp4', source)
+        self.assertEqual(report.frames, 167)  # 180 source frames, 20 selected frames → 7 at 3x.
+        self.assertEqual(len(probe(out, Runner()).audio), 0)
+
+    def test_feather_softens_inside_ellipse_edge_without_expanding_mask(self):
+        from PIL import Image, ImageChops, ImageStat
+        pattern = Image.new('RGB', (320, 180))
+        pattern.putdata([(255, 255, 255) if (x//2+y//2)%2 else (0, 0, 0)
+                         for y in range(180) for x in range(320)])
+        asset = self.root/'checker.png'
+        pattern.save(asset)
+        source = self.root/'checker.mp4'
+        command('ffmpeg', '-v', 'error', '-y', '-loop', '1', '-framerate', '20', '-i', str(asset),
+                '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-g', '40', str(source))
+        edit = Edit(0, 2, 'region', Rect(.25, .25, .5, .5), shape='ellipse')
+        hard, _ = self.export([edit], 'hard-ellipse.mp4', source)
+        edit.feather = 12
+        soft, _ = self.export([edit], 'soft-ellipse.mp4', source)
+        original, hard_image, soft_image = (image_at(path, 20) for path in (source, hard, soft))
+        def difference(changed, box):
+            return sum(ImageStat.Stat(ImageChops.difference(original.crop(box), changed.crop(box))).mean)
+        edge = (81, 84, 88, 96)
+        self.assertGreater(difference(hard_image, edge), difference(soft_image, edge)*1.2)
+        self.assertGreater(difference(soft_image, (150, 80, 170, 100)), 250)
+        self.assertLess(difference(soft_image, (65, 80, 75, 100)), 15)
+
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix='qpixel-test-')

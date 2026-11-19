@@ -11,6 +11,7 @@ from pathlib import Path
 from .media import index_video, probe
 from .model import Project, plan_ranges, frame_bounds
 from .process import Runner
+from .masks import mask_image
 
 
 FFMPEG = ['ffmpeg', '-hide_banner', '-v', 'warning', '-nostdin', '-y']
@@ -52,7 +53,7 @@ def require_idr(info, frame, runner):
     raise ValueError('拼接边界不是独立 IDR 帧，可能使用了开放 GOP；首版拒绝快速拼接以免重复或丢失画面。')
 
 
-def effect_graph(edits, width, height, offset, workspace, fps, scale=None):
+def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed=1):
     """Stage assets under safe names; user paths never appear inside filter syntax."""
     graph = ['[0:v:0]setpts=PTS-STARTPTS[v0]']
     inputs = []
@@ -72,24 +73,90 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None):
         if edit.effect == 'blur':
             graph.append(f"[{before}]boxblur=luma_radius={radius}:luma_power=2:chroma_radius={max(1, radius//2)}:enable='{enable}'[{after}]")
         elif edit.effect == 'region':
-            radius = min(radius, max(1, min(w, h) // 4))
-            graph.extend([f'[{before}]split[base{i}][crop{i}]',
-                          f'[crop{i}]crop={w}:{h}:{x}:{y},boxblur={radius}:2[blur{i}]',
-                          f"[base{i}][blur{i}]overlay={x}:{y}:enable='{enable}':eof_action=pass[{after}]"])
-        else:
+            image_index += 1
+            asset = workspace / f'mask-{i}.png'
+            if not mask_image(edit, width, height).save(str(asset)):
+                raise ValueError('无法写入遮罩。')
+            inputs += ['-loop', '1', '-framerate', str(fps), '-i', str(asset)]
+            graph.extend([f'[{before}]format=gbrp,split[base{i}][crop{i}]',
+                          f'[crop{i}]boxblur={radius}:2[blur{i}]',
+                          f'[{image_index}:v]format=gbrp[maskraw{i}]'])
+            if edit.feather:
+                sigma = max(.1, edit.feather*min(width, height)/100/3)
+                graph.extend([f'[maskraw{i}]split[hard{i}][soft{i}]',
+                              f'[soft{i}]gblur=sigma={sigma:.6f}[feather{i}]',
+                              f'[hard{i}][feather{i}]blend=all_mode=multiply[mask{i}]'])
+            else:
+                graph.append(f'[maskraw{i}]null[mask{i}]')
+            graph.append(f"[base{i}][blur{i}][mask{i}]maskedmerge=enable='{enable}'[{after}]")
+        elif edit.effect == 'image':
             image_index += 1
             suffix = Path(edit.image).suffix.lower()
             asset = workspace / f'asset-{i}{suffix}'
             shutil.copyfile(edit.image, asset)
-            inputs += ['-loop', '1', '-i', str(asset)]
+            inputs += ['-loop', '1', '-framerate', str(fps), '-i', str(asset)]
             graph.extend([f'[{image_index}:v]scale={w}:{h},format=rgba[image{i}]',
                           f"[{before}][image{i}]overlay={x}:{y}:enable='{enable}':shortest=1[{after}]"])
+        else:
+            graph.append(f'[{before}]null[{after}]')
     last = f'v{len(edits)}'
+    if speed != 1:
+        graph.append(f'[{last}]setpts=(PTS-STARTPTS)/{speed:.12f},fps={fps}[retimed]')
+        last = 'retimed'
     if scale:
         graph.append(f"[{last}]scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,scale=w='min({scale},iw)':h=-2[out]")
     else:
         graph.append(f'[{last}]null[out]')
     return inputs, ';'.join(graph)
+
+
+def speed_sections(edits, start, end, fps):
+    cuts = {start, end}
+    speeds = []
+    for edit in edits:
+        if edit.speed != 1:
+            a, b = frame_bounds(edit, fps)
+            if a < end and b > start:
+                cuts.update((max(a, start), min(b, end)))
+                speeds.append((a, b, edit.speed))
+    cuts = sorted(cuts)
+    return [(a, b, next((s for x, y, s in speeds if x <= a < y), 1))
+            for a, b in zip(cuts, cuts[1:])]
+
+
+def output_frames(start, end, speed):
+    return max(1, round((end-start)/speed))
+
+
+def tempo_chain(speed):
+    factors = []
+    while speed < .5:
+        factors.append(.5)
+        speed /= .5
+    while speed > 2:
+        factors.append(2)
+        speed /= 2
+    return ','.join(f'atempo={s:.12f}' for s in factors+[speed])
+
+
+def audio_graph(info, edits, start, end, input_index):
+    sections = speed_sections(edits, start, end, info.fps_float)
+    graph, maps = [], []
+    for track in range(len(info.audio)):
+        labels = ''.join(f'[a{track}s{i}]' for i in range(len(sections)))
+        # Keep delayed tracks aligned with video; STARTPTS alone would pull their
+        # first audible sample to zero and permanently lose the initial silence.
+        graph.append(f'[{input_index}:a:{track}]aresample=async=1:first_pts=0,asplit={len(sections)}{labels}')
+        for i, (a, b, speed) in enumerate(sections):
+            count = output_frames(a, b, speed)
+            duration = count/info.fps_float
+            effective = (b-a)/count
+            graph.append(f'[a{track}s{i}]atrim=start={a/info.fps_float:.12f}:end={b/info.fps_float:.12f},'
+                         f'asetpts=PTS-STARTPTS,{tempo_chain(effective)},apad,atrim=duration={duration:.12f}[a{track}p{i}]')
+        graph.append(''.join(f'[a{track}p{i}]' for i in range(len(sections)))+
+                     f'concat=n={len(sections)}:v=0:a=1[aout{track}]')
+        maps += ['-map', f'[aout{track}]']
+    return ';'.join(graph), maps
 
 
 def _encoder(info):
@@ -149,41 +216,56 @@ class Exporter:
                 for span in spans:
                     require_idr(info, span.start, runner)
                 encoded = sum(s.end-s.start for s in spans if s.encode) / info.fps_float
+                retimed = any(e.speed != 1 for e in project.edits)
+                pieces = [(a, b, speed, span.encode) for span in spans
+                          for a, b, speed in speed_sections(project.edits, span.start, span.end, info.fps_float)]
+                expected_frames = sum(output_frames(a, b, speed) for a, b, speed, _ in pieces)
                 runner.log(f'计划：总帧数 {index.frames}，局部重编码 {encoded:.3f}s，其余直接复制。')
                 files = []
                 processed = 0
-                for i, span in enumerate(spans):
+                for i, (first, last, speed, encode) in enumerate(pieces):
                     runner.check()
-                    count = span.end - span.start
-                    duration = count / info.fps_float
-                    start = span.start / info.fps_float
+                    count = last - first
+                    result_count = output_frames(first, last, speed)
+                    duration = result_count / info.fps_float
+                    start = first / info.fps_float
                     target = work / f'part-{i:04d}.ts'
                     base, weight = 5 + 75 * processed / index.frames, 75 * count / index.frames
-                    runner.report(base, f'{"局部编码" if span.encode else "直接复制"} {i+1}/{len(spans)} · {start:.2f}–{span.end/info.fps_float:.2f}s')
+                    runner.report(base, f'{"局部编码" if encode else "直接复制"} {i+1}/{len(pieces)} · {start:.2f}–{last/info.fps_float:.2f}s')
                     args = FFMPEG + ['-seek_timestamp', '1', '-ss', f'{start:.9f}', '-i', info.path]
-                    if span.encode:
-                        edits = [e for e in project.edits if e.start < span.end/info.fps_float and e.end > start]
-                        inputs, graph = effect_graph(edits, info.width, info.height, start, work, info.fps_float)
+                    if encode:
+                        edits = [e for e in project.edits if e.start < last/info.fps_float and e.end > start]
+                        inputs, graph = effect_graph(edits, info.width, info.height, start, work, info.fps_float,
+                                                     speed=count/result_count)
                         args += inputs + ['-filter_complex', graph, '-map', '[out]'] + _encoder(info)
                     else:
-                        if span.start:
+                        if first:
                             # Matroska seeks may preroll an entire GOP. Output-side streamcopy
                             # trims on DTS, so preserve the target IDR's negative decode delay.
-                            seek_dts = index.key_dts.get(span.start, start-int(info.video.get('has_b_frames', 0))/info.fps_float)
+                            seek_dts = index.key_dts.get(first, start-int(info.video.get('has_b_frames', 0))/info.fps_float)
                             args += ['-ss', f'{seek_dts-start-.00001:.9f}']
                         args += ['-map', f'0:{info.video["index"]}', '-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb']
-                    args += ['-an', '-frames:v', str(count), '-mpegts_flags', '+resend_headers',
+                    args += ['-an', '-frames:v', str(result_count), '-mpegts_flags', '+resend_headers',
                              '-muxdelay', '0', '-progress', 'pipe:1', '-f', 'mpegts', str(target)]
                     runner.run(args, duration, base, weight)
-                    files.append((target.name, duration))
+                    # Absolute file URLs bypass concat's URL resolution of # in a parent path.
+                    files.append(('file:' + target.as_posix(), duration))
                     processed += count
                 listing = work / 'parts.ffconcat'
                 listing.write_text('ffconcat version 1.0\n' + ''.join(
-                    f"file '{name}'\nduration {duration:.12f}\n" for name, duration in files), encoding='ascii')
+                    "file '" + name.replace("'", "'\\''") + f"'\nduration {duration:.12f}\n" for name, duration in files), encoding='utf-8')
                 runner.report(82, '正在拼接视频并保留原始完整音轨…')
                 args = FFMPEG + ['-f', 'concat', '-safe', '0', '-i', str(listing), '-i', info.path,
-                                 '-map', '0:v:0', '-map', '1:a?', '-map_metadata', '1', '-c', 'copy',
-                                 '-avoid_negative_ts', 'disabled']
+                                 '-map', '0:v:0', '-map_metadata', '1', '-c:v', 'copy', '-avoid_negative_ts', 'disabled']
+                if retimed and info.audio:
+                    graph, maps = audio_graph(info, project.edits, 0, index.frames, 1)
+                    args += ['-filter_complex', graph] + maps + ['-c:a', 'aac', '-b:a', '192k']
+                    for track, metadata in enumerate(info.audio):
+                        for key, value in metadata.get('tags', {}).items():
+                            if key.lower() in ('language', 'title'):
+                                args += [f'-metadata:s:a:{track}', f'{key}={value}']
+                else:
+                    args += ['-map', '1:a?', '-c:a', 'copy']
                 if destination.suffix.lower() == '.mp4':
                     # avc3 explicitly allows parameter-set updates in-band at splice boundaries.
                     args += ['-tag:v', 'avc3', '-video_track_timescale', '90000', '-movflags', '+faststart']
@@ -192,17 +274,20 @@ class Exporter:
                 runner.report(91, '正在校验输出帧数、时间戳和接缝…')
                 result_info = probe(pending, runner)
                 result_index = index_video(result_info, runner)
-                if result_index.frames != index.frames or len(result_info.audio) != len(info.audio):
+                if result_index.frames != expected_frames or len(result_info.audio) != len(info.audio):
                     raise ValueError('拼接校验失败：视频帧数或音轨数量发生变化。未交付输出文件。')
                 # Decode the GOPs touching every splice; untouched hours are never re-encoded.
-                for span in spans:
+                output_cursor = 0
+                for a, b, speed, encode in pieces:
                     runner.check()
-                    if span.encode:
-                        start = max(0, span.start/info.fps_float - 1/info.fps_float)
-                        duration = (span.end-span.start+2)/info.fps_float
+                    count = output_frames(a, b, speed)
+                    if encode:
+                        start = max(0, (output_cursor-1)/info.fps_float)
+                        duration = (count+2)/info.fps_float
                         runner.run(['ffmpeg', '-v', 'error', '-xerror', '-nostdin', '-ss', f'{start:.9f}',
                                     '-i', str(pending), '-t', f'{duration:.9f}', '-an', '-f', 'null', '-'])
-                frame_count = index.frames
+                    output_cursor += count
+                frame_count = expected_frames
             runner.check()
             # Recheck for external changes before replacing a destination.
             project.check_source()
@@ -224,10 +309,19 @@ def render_preview(project: Project, edit_index: int, destination, runner: Runne
         raise ValueError('片段没有覆盖任何视频帧，请扩大时间范围。')
     start, duration = first/info.fps_float, (last-first)/info.fps_float
     with tempfile.TemporaryDirectory(prefix='qpixel-preview-') as directory:
-        inputs, graph = effect_graph([edit], info.width, info.height, start, Path(directory), info.fps_float, 960)
+        count = output_frames(first, last, edit.speed)
+        effective = (last-first)/count
+        inputs, graph = effect_graph([edit], info.width, info.height, start, Path(directory), info.fps_float, 960, effective)
+        audio_maps = ['-map', '0:a?']
+        if edit.speed != 1 and info.audio:
+            # Input seek resets timestamps; express the preview edit on that local timeline.
+            from dataclasses import replace
+            audio, audio_maps = audio_graph(info, [replace(edit, start=0, end=duration)], 0, last-first, 0)
+            graph += ';' + audio
+        duration = count/info.fps_float
         runner.report(1, '正在生成该片段的真实效果预览…')
         runner.run(FFMPEG + ['-seek_timestamp', '1', '-ss', f'{start:.9f}', '-i', info.path] + inputs +
-                   ['-filter_complex', graph, '-map', '[out]', '-map', '0:a?', '-t', f'{duration:.9f}', '-frames:v', str(last-first),
+                   ['-filter_complex', graph, '-map', '[out]'] + audio_maps + ['-t', f'{duration:.9f}', '-frames:v', str(count),
                     '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-pix_fmt', 'yuv420p',
                     '-c:a', 'aac', '-progress', 'pipe:1', str(destination)], duration, 1, 98)
     return str(destination)

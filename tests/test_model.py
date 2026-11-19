@@ -7,6 +7,23 @@ from q_pixelate.model import Edit, Project, Rect, plan_ranges
 
 
 class ModelTests(unittest.TestCase):
+    def test_extended_edit_persistence_and_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.mp4'
+            source.write_bytes(b'video')
+            edit = Edit(1, 3, 'region', speed=2, shape='lasso',
+                        points=[(.1, .1), (.8, .1), (.4, .8)], feather=5,
+                        range_locked=True, locked=True)
+            path = root / 'new.qpixel'
+            Project(str(source), [edit]).save(path)
+            self.assertEqual(Project.load(path).edits, [edit])
+            for updates in ({'speed': 0}, {'speed': float('nan')}, {'shape': 'bad'},
+                            {'feather': -1}, {'points': [(0, 0)]}, {'locked': 'yes'}):
+                from dataclasses import replace
+                with self.subTest(updates=updates), self.assertRaises(ValueError):
+                    replace(edit, **updates).validate(6)
+
     def test_reject_overlap_invalid_coordinates_and_nonfinite_times(self):
         for edits in ([Edit(1, 3), Edit(2, 4)], [Edit(float('nan'), 2)],
                       [Edit(2, 1)], [Edit(0, 6)], [Edit(0, 1, rect=Rect(-.1, 0, .2, .2))]):

@@ -6,6 +6,7 @@ from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QValidator
 from PySide6.QtWidgets import QDoubleSpinBox, QWidget
 
 from .model import Rect
+from .masks import mask_path
 
 
 def time_text(seconds):
@@ -48,11 +49,13 @@ class TimeSpinBox(QDoubleSpinBox):
 
 class VideoCanvas(QWidget):
     rectChanged = Signal(object)
+    pointsChanged = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(320, 180)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.image = QImage()
         self.dimensions = (1920, 1080)
         self.auto_dimensions = False
@@ -64,6 +67,12 @@ class VideoCanvas(QWidget):
         self.anchor = None
         self.drag_mode = None
         self.original_rect = None
+        self.shape = 'rect'
+        self.points = []
+        self.draw_new = True
+
+    def redraw(self):
+        self.draw_new = True
 
     def set_dimensions(self, width, height):
         self.dimensions = width, height
@@ -109,10 +118,12 @@ class VideoCanvas(QWidget):
             p.drawText(self.rectGeometry(), Qt.AlignmentFlag.AlignCenter, '打开视频，开始局部修订\n\nMP4 / MKV · 本地处理')
         if self.show_mask:
             mask = self.mask_rect()
-            p.fillRect(mask, QColor(94, 196, 175, 35))
+            path = mask_path('rect' if self.fullscreen_mask else self.shape,
+                             Rect(0, 0, 1, 1) if self.fullscreen_mask else self.rect, self.points, box)
+            p.fillPath(path, QColor(94, 196, 175, 35))
             p.setPen(QPen(QColor('#6ee7c0'), 2, Qt.PenStyle.DashLine))
-            p.drawRect(mask)
-            if not self.fullscreen_mask:
+            p.drawPath(path)
+            if not self.fullscreen_mask and self.shape != 'lasso':
                 p.fillRect(QRectF(mask.bottomRight()-QPointF(5, 5), mask.bottomRight()+QPointF(5, 5)), QColor('#6ee7c0'))
             p.setPen(QColor('#b5f5df'))
             p.drawText(box.adjusted(12, 12, -12, -12), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
@@ -125,9 +136,16 @@ class VideoCanvas(QWidget):
         if not self.editable or event.button() != Qt.MouseButton.LeftButton or not self.video_rect().contains(event.position()):
             return
         self.anchor = self.normalized_point(event.position())
+        if self.shape == 'lasso':
+            self.points = [(self.anchor.x(), self.anchor.y())]
+            self.drag_mode = 'lasso'
+            self.update()
+            return
         self.original_rect = Rect(self.rect.x, self.rect.y, self.rect.w, self.rect.h)
         box = self.mask_rect()
-        if (event.position()-box.bottomRight()).manhattanLength() < 18:
+        if self.draw_new:
+            self.drag_mode = 'draw'
+        elif (event.position()-box.bottomRight()).manhattanLength() < 18:
             self.drag_mode = 'resize'
         elif box.contains(event.position()):
             self.drag_mode = 'move'
@@ -139,6 +157,12 @@ class VideoCanvas(QWidget):
             return
         current = self.normalized_point(event.position())
         a, r = self.anchor, self.original_rect
+        if self.drag_mode == 'lasso':
+            point = (current.x(), current.y())
+            if not self.points or abs(point[0]-self.points[-1][0])+abs(point[1]-self.points[-1][1]) > .003:
+                self.points.append(point)
+            self.update()
+            return
         if self.drag_mode == 'move':
             self.rect = Rect(max(0, min(1-r.w, r.x+current.x()-a.x())),
                              max(0, min(1-r.h, r.y+current.y()-a.y())), r.w, r.h)
@@ -154,6 +178,14 @@ class VideoCanvas(QWidget):
     def mouseReleaseEvent(self, event):
         if self.anchor is not None:
             self.mouseMoveEvent(event)
+            if self.drag_mode == 'lasso' and len(self.points) >= 3:
+                xs, ys = zip(*self.points)
+                self.rect = Rect(min(xs), min(ys), max(.001, max(xs)-min(xs)), max(.001, max(ys)-min(ys)))
+                finished_rect = self.rect
+                self.pointsChanged.emit(list(self.points))
+                self.rect = finished_rect
+                self.rectChanged.emit(self.rect)
+            self.draw_new = False
         self.anchor = None
         self.drag_mode = None
 
@@ -174,6 +206,8 @@ class Timeline(QWidget):
         self.view_start = 0
         self.drag = None
         self.anchor = 0
+        self.selection_locked = False
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
 
     @property
@@ -201,7 +235,8 @@ class Timeline(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), QColor('#131923'))
-        p.fillRect(QRectF(20, 54, self.width()-40, 42), QColor('#202b3a'))
+        p.fillRect(QRectF(20, 34, self.width()-40, 18), QColor('#2d3546'))
+        p.fillRect(QRectF(20, 60, self.width()-40, 42), QColor('#202b3a'))
         if not self.duration:
             return
         steps = [0.1, .2, .5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1800, 3600, 10800]
@@ -214,30 +249,44 @@ class Timeline(QWidget):
             p.setPen(QColor('#526078'))
             p.drawLine(x, 39, x, 102)
             p.setPen(QColor('#99a8be'))
-            p.drawText(x+4, 28, time_text(t).split('.')[0] if step >= 1 else time_text(t))
+            p.drawText(x+4, 25, time_text(t).split('.')[0] if step >= 1 else time_text(t))
             t += step
         p.setClipRect(19, 42, self.width()-38, 62)
         for edit in self.edits:
             x1, x2 = self.point_for_time(edit.start).x(), self.point_for_time(edit.end).x()
-            color = QColor('#296f69') if edit.effect != 'image' else QColor('#7460a0')
+            color = QColor('#415568') if edit.locked else QColor('#296f69') if edit.effect != 'image' else QColor('#7460a0')
             p.fillRect(QRectF(x1, 58, max(2, x2-x1), 34), color)
         left, right = (self.point_for_time(t).x() for t in self.selection)
-        p.fillRect(QRectF(left, 48, max(0, right-left), 49), QColor(110, 231, 192, 28))
+        p.fillRect(QRectF(left, 60, max(0, right-left), 42), QColor(110, 231, 192, 28))
         p.setPen(QPen(QColor('#6ee7c0'), 2))
-        p.drawRect(QRectF(left, 48, max(0, right-left), 49))
+        p.drawRect(QRectF(left, 60, max(0, right-left), 42))
         for x in (left, right):
-            p.fillRect(QRectF(x-3, 48, 6, 49), QColor('#6ee7c0'))
+            p.fillRect(QRectF(x-3, 60, 6, 42), QColor('#6ee7c0'))
         x = self.point_for_time(self.position).x()
         p.setPen(QPen(QColor('#ffb86b'), 2))
-        p.drawLine(x, 43, x, 104)
+        p.drawLine(x, 34, x, 52)
+        p.setClipping(False)
+        p.setPen(QColor('#9aacc2'))
+        p.drawText(20, 115, '上：播放定位    下：片段选区' + ('（已锁定）' if self.selection_locked else '') + '    中键 / Alt 拖动：平移')
         p.setClipping(False)
 
     def mousePressEvent(self, event):
-        if not self.duration or event.button() != Qt.MouseButton.LeftButton:
+        if not self.duration:
+            return
+        self.setFocus()
+        if event.button() == Qt.MouseButton.MiddleButton or (event.button() == Qt.MouseButton.LeftButton and event.modifiers() & Qt.AltModifier):
+            self.drag = 'pan'
+            self.pan_x = event.position().x()
+            self.pan_start = self.view_start
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
             return
         self.anchor = self.time_at(event.position().x())
         left, right = (self.point_for_time(t).x() for t in self.selection)
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+        if event.position().y() < 58 or self.selection_locked:
+            self.drag = 'seek'
+            self.seekRequested.emit(self.anchor)
+        elif event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
             self.drag = 'range'
         elif abs(event.position().x()-left) < 9:
             self.drag = 'left'
@@ -249,6 +298,9 @@ class Timeline(QWidget):
 
     def mouseMoveEvent(self, event):
         if not self.drag:
+            return
+        if self.drag == 'pan':
+            self.set_view_start(self.pan_start + (self.pan_x-event.position().x())/max(1, self.width()-40)*self.visible)
             return
         t = self.time_at(event.position().x())
         a, b = self.selection
@@ -272,3 +324,8 @@ class Timeline(QWidget):
     def wheelEvent(self, event):
         if self.duration:
             self.set_zoom(max(1, min(100, self.zoom*(1.3 if event.angleDelta().y()>0 else 1/1.3))))
+
+    def set_view_start(self, value):
+        self.view_start = max(0, min(self.duration-self.visible, value))
+        self.viewChanged.emit(self.view_start)
+        self.update()

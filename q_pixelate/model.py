@@ -32,13 +32,39 @@ class Edit:
     rect: Rect = field(default_factory=Rect)
     strength: int = 20
     image: str = ''
+    speed: float = 1.0
+    shape: str = 'rect'
+    points: list[tuple[float, float]] = field(default_factory=list)
+    feather: float = 0
+    range_locked: bool = False
+    locked: bool = False
 
     def validate(self, duration: float):
         if (any(not isinstance(t, (int, float)) or not math.isfinite(t) for t in (self.start, self.end))
                 or not 0 <= self.start < self.end <= duration + .00001):
             raise ValueError('片段时间必须满足 0 ≤ 入点 < 出点 ≤ 视频时长。')
-        if self.effect not in ('blur', 'region', 'image'):
+        if self.effect not in ('blur', 'region', 'image', 'none'):
             raise ValueError('未知的遮挡效果。')
+        if not isinstance(self.speed, (int, float)) or not math.isfinite(self.speed) or not .25 <= self.speed <= 4:
+            raise ValueError('片段速度须为 0.25–4 倍。')
+        if self.shape not in ('rect', 'ellipse', 'lasso'):
+            raise ValueError('未知的遮罩形状。')
+        if not isinstance(self.feather, (int, float)) or not math.isfinite(self.feather) or not 0 <= self.feather <= 20:
+            raise ValueError('羽化范围须为 0–20%。')
+        if not isinstance(self.range_locked, bool) or not isinstance(self.locked, bool):
+            raise ValueError('片段锁定状态无效。')
+        if not isinstance(self.points, list):
+            raise ValueError('套索路径无效。')
+        for point in self.points:
+            if (not isinstance(point, (tuple, list)) or len(point) != 2 or
+                    any(not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1 for v in point)):
+                raise ValueError('套索路径必须位于画面内。')
+        if self.shape == 'lasso':
+            if len(self.points) < 3:
+                raise ValueError('请绘制至少三个点的套索遮罩。')
+            area = abs(sum(a[0]*b[1]-b[0]*a[1] for a, b in zip(self.points, self.points[1:]+self.points[:1])))
+            if area < .000001:
+                raise ValueError('套索遮罩面积太小。')
         self.rect.validate()
         if not isinstance(self.strength, int) or not 1 <= self.strength <= 100:
             raise ValueError('模糊强度须为 1–100。')
@@ -83,7 +109,7 @@ class Project:
             except ValueError:
                 return str(Path(value).resolve())
         edits = [asdict(e) | {'image': relative(e.image)} for e in self.edits]
-        data = {'version': 1, 'source': relative(self.source),
+        data = {'version': 2, 'source': relative(self.source),
                 'fingerprint': self.fingerprint, 'edits': edits}
         name = None
         try:
@@ -101,7 +127,7 @@ class Project:
         path = Path(path).resolve()
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
-            if not isinstance(data, dict) or data.get('version') != 1:
+            if not isinstance(data, dict) or data.get('version') not in (1, 2):
                 raise ValueError('工程格式或版本不受支持。')
             def absolute(value):
                 if not isinstance(value, str):
@@ -112,6 +138,8 @@ class Project:
                 raw = dict(raw)
                 raw['rect'] = Rect(**raw.get('rect', {}))
                 raw['image'] = absolute(raw.get('image', ''))
+                if isinstance(raw.get('points', []), list):
+                    raw['points'] = [tuple(p) if isinstance(p, list) else p for p in raw.get('points', [])]
                 edits.append(Edit(**raw))
             project = cls(absolute(data['source']), edits, data.get('fingerprint', {}))
             project.validate()

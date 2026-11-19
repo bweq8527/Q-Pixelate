@@ -1,4 +1,16 @@
-# 验证记录
+# 验证记录 · 2026-11-20
+
+`python -m unittest discover -s tests -v`: 51 tests passed (39.265s). `python -m compileall -q q_pixelate`: passed.
+
+Added real FFmpeg checks for per-clip speed and preview, two speed changes inside one GOP, 0.25× at EOF, 3× fractional FPS without audio, all audio tracks/language retention and delayed audio onset. A 6-second 120-frame fixture with 2–4s at 2× produces 100 frames/5 seconds; original prefix and shifted tail frame hashes remain identical.
+
+Mask checks cover ellipse geometry, lasso rendering, inside-only feather with pixel differences, PNG alpha and Unicode/punctuation paths. Qt checks cover range/completed locks, confirmation before switch/export, Space on focused buttons, frame/Shift/held arrow navigation, pan independent of selection, lasso path/bounds preservation, legacy-range dirty state, and persistent copied sticker imports. Screenshots inspected at default and minimum window sizes using offscreen Qt, without desktop automation.
+
+Independent review findings (delayed audio retime and legacy unsaved range changes) reproduced RED → GREEN. Slow reverse preview uses silent repeated seeking rather than hardware reverse playback; smoothness on long high-resolution recordings remains dependent on local decoding. Existing supported-codec and avc3 website compatibility limitations still apply.
+
+---
+
+# 历史验证 · 2026-11-19
 
 日期：2026-11-19。环境：Windows、Python 3.12.2、PySide6/Qt 6.11.2、FFmpeg 8.0.1（libx264）。
 

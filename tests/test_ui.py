@@ -31,6 +31,7 @@ class UiTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        QTest.qWait(200)  # Qt releases media handles asynchronously after setSource(QUrl()).
         cls.temp.cleanup()
 
     def test_editor_add_modify_and_project_roundtrip(self):
@@ -87,7 +88,7 @@ class UiTests(unittest.TestCase):
             time.sleep(.01)
         self.assertTrue(condition())
 
-    def test_open_decodes_initial_frame_and_worker_export_commits_form(self):
+    def test_open_decodes_initial_frame_and_export_requires_confirmed_form(self):
         window = MainWindow()
         errors = []
         window.error = errors.append
@@ -98,6 +99,9 @@ class UiTests(unittest.TestCase):
         window.add_edit()
         window.effect.setCurrentIndex(1)
         out = Path(self.temp.name) / 'worker-export.mp4'
+        window.export_to(out)
+        self.assertFalse(out.is_file())
+        self.assertTrue(window.apply_edit())
         window.export_to(out)
         self.wait_until(lambda: window.worker is None)
         self.assertEqual(errors, [])
@@ -134,11 +138,16 @@ class UiTests(unittest.TestCase):
         window.close()
         self.assertTrue(dirty, 'Unsaved form edits must trigger the save/discard prompt')
 
-    def test_switching_clips_preserves_pending_mask_settings(self):
+    def test_switching_clips_requires_confirmation_and_preserves_mask_settings(self):
         window = MainWindow()
         window.set_project(Project(str(self.source), [Edit(1, 2), Edit(3, 4)]), probe(self.source, Runner()))
         window.clip_list.setCurrentRow(0)
+        window.toggle_range_lock()
         window.strength.setValue(37)
+        window.clip_list.setCurrentRow(1)
+        self.assertEqual(window.clip_list.currentRow(), 0)
+        self.assertEqual(window.strength.value(), 37)
+        window.apply_edit()
         window.clip_list.setCurrentRow(1)
         strength = window.project.edits[0].strength
         window.dirty = False
