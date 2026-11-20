@@ -461,9 +461,19 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         if not launcher or not Path(launcher).is_file():
             self.error('找不到启动器，请重新启动 Q-Pixelate。')
             return
-        arguments = [launcher, '--component-action', action, key]
-        if archive:
-            arguments.append(archive)
+        arguments = [launcher]
+        if action == 'move-components':
+            arguments.extend(['--move-components', archive])
+            if key == 'cleanup':
+                arguments.append('--remove-old-copy')
+        elif action == 'move-program':
+            arguments.append('--relocate-program')
+        elif action == 'open-installer':
+            arguments.extend(['--start-installer', archive])
+        else:
+            arguments.extend(['--component-action', action, key])
+            if archive:
+                arguments.append(archive)
         arguments.extend(['--wait-pid', str(os.getpid()), '--'])
         if self.close():
             try:

@@ -39,6 +39,38 @@ def sha256(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def reuse_components(catalog, output, rebuilding, base_url):
+    previous = json.loads(catalog.read_text(encoding='utf-8-sig'))
+    if previous.get('architecture') != 'win-x64':
+        raise ValueError('The previous component catalog must be for Windows x64.')
+    entries = {}
+    for name, entry in previous['components'].items():
+        if name not in COMPONENTS or name in rebuilding:
+            continue
+        filename = entry['archive']
+        if Path(filename).name != filename or '\\' in filename or ':' in filename or not filename.endswith('.zip'):
+            raise ValueError(f'Invalid release filename for {name}: {filename}')
+        source = catalog.parent / filename
+        if source.stat().st_size != entry['size'] or sha256(source) != entry['sha256']:
+            raise ValueError(f'Previously built archive failed verification: {source}')
+        target = output / filename
+        if target.exists():
+            if not target.samefile(source) and sha256(target) != entry['sha256']:
+                raise ValueError(f'Conflicting output archive: {target}')
+        else:
+            try:
+                os.link(source, target)
+            except OSError:
+                temporary = target.with_suffix('.zip.partial')
+                try:
+                    shutil.copyfile(source, temporary)
+                    temporary.replace(target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        entries[name] = {**entry, 'url': f'{base_url.rstrip("/")}/{filename}' if base_url else entry.get('url', '')}
+    return entries
+
+
 def fetch(name, entry, cache, offline):
     path = cache / name
     if path.is_file() and sha256(path) == entry['sha256']:
@@ -184,6 +216,7 @@ def main():
     parser.add_argument('--components', nargs='*', choices=COMPONENTS, default=COMPONENTS)
     parser.add_argument('--skip-launcher', action='store_true')
     parser.add_argument('--offline', action='store_true', help='Require all inputs in the local cache')
+    parser.add_argument('--reuse-catalog', type=Path, help='Reuse unchanged archives from a verified previous release')
     args = parser.parse_args()
     if (sys.platform != 'win32' or platform.machine().upper() != 'AMD64'
             or struct.calcsize('P') != 8 or sys.version_info[:2] != (3, 12)):
@@ -207,7 +240,8 @@ def main():
                 'gpu': f'{ORT_VERSION}-cuda12', '320n': MODEL_VERSION, '640m': MODEL_VERSION}
     requires = {'cpu': ['base'], 'gpu': ['base']}
     lock = json.loads(LOCK.read_text(encoding='utf-8'))
-    entries = {}
+    entries = (reuse_components(args.reuse_catalog.resolve(), args.output, set(args.components), args.base_url)
+               if args.reuse_catalog else {})
     for component in dict.fromkeys(args.components):
         version = versions[component]
         filename = f'q-pixelate-{component}-{version}-win-x64.zip'

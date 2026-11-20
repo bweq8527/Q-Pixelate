@@ -1,4 +1,4 @@
-"""Portable component storage, validation and executable discovery."""
+"""Component storage, validation and executable discovery."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import tempfile
 import time
 import zipfile
 from contextlib import contextmanager
+from copy import copy
 from functools import lru_cache
 from pathlib import Path, PureWindowsPath
 from urllib.request import urlopen
@@ -62,6 +63,57 @@ def _exists(path):
 
 def _linked(path):
     return path.is_symlink() or (hasattr(path, 'is_junction') and path.is_junction())
+
+
+def _setting_path(value, relative_to=None):
+    if not isinstance(value, str) or not value or '\x00' in value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        if relative_to is None or path.anchor:
+            return None
+        path = relative_to / path
+    try:
+        # Resolve parent aliases while retaining a final link for the ownership checks.
+        return path.parent.resolve() / path.name if _linked(path) else path.resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _write_json(path, data, *, runner=None):
+    with tempfile.TemporaryDirectory(dir=path.parent, prefix='.settings-', ignore_cleanup_errors=True) as workspace:
+        pending = Path(workspace) / path.name
+        with pending.open('x', encoding='utf-8') as output:
+            json.dump(data, output, indent=2, ensure_ascii=False)
+            output.flush()
+            os.fsync(output.fileno())
+        if runner is not None:
+            runner.check()
+        pending.replace(path)
+
+
+@contextmanager
+def _directory_lock(directory, name='.change.lock'):
+    try:
+        if _linked(directory):
+            raise ComponentError(f'目录不能是符号链接或目录联接：{directory}。')
+        directory.mkdir(parents=True, exist_ok=True)
+        lock = directory / name
+        if _linked(lock):
+            raise ComponentError('组件锁文件路径无效。')
+        with lock.open('a+b') as handle:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                raise ComponentError('已有组件变更任务正在运行。') from error
+            yield
+    except OSError as error:
+        raise ComponentError(f'无法修改目录 {directory}，请确认有足够的磁盘空间和写入权限：{error}') from error
 
 
 def _run_probe(args, runner=None, *, timeout=45):
@@ -187,17 +239,84 @@ def _extract(zip_path, directory, runner):
     return total
 
 
+def _copy_components(sources, stage, destination, runner):
+    def raise_error(error):
+        raise error
+
+    files = []
+    for source in sources:
+        root = stage / source.name
+        root.mkdir()
+        for directory, folders, names in source.walk(on_error=raise_error):
+            runner.check()
+            target = root / directory.relative_to(source)
+            for name in folders:
+                if _linked(directory / name):
+                    raise ComponentError(f'无法迁移包含目录联接的组件：{directory / name}。')
+                (target / name).mkdir()
+            for name in names:
+                original = directory / name
+                state = original.lstat()
+                if _linked(original) or not stat.S_ISREG(state.st_mode):
+                    raise ComponentError(f'无法迁移包含特殊文件的组件：{original}。')
+                files.append((original, target / name, state.st_size))
+    total = sum(size for _, _, size in files)
+    if shutil.disk_usage(destination).free < total:
+        raise ComponentError(f'目标目录没有足够的磁盘空间：{destination}。')
+
+    copied = 0
+    for original, target, size in files:
+        runner.check()
+        digest = hashlib.sha256()
+        count = 0
+        with original.open('rb') as source, target.open('xb') as output:
+            for block in iter(lambda: source.read(_BLOCK_SIZE), b''):
+                runner.check()
+                output.write(block)
+                digest.update(block)
+                count += len(block)
+                copied += len(block)
+                runner.report(10 + 50 * copied / max(total, 1), '正在复制组件…')
+        duplicate = hashlib.sha256()
+        with target.open('rb') as output:
+            for block in iter(lambda: output.read(_BLOCK_SIZE), b''):
+                runner.check()
+                duplicate.update(block)
+        if count != size or duplicate.digest() != digest.digest():
+            raise ComponentError(f'组件文件复制校验失败：{original}。')
+        shutil.copymode(original, target)
+
+
 class ComponentManager:
     def __init__(self, root: Path | None = None):
         default = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent.parent
         self.root = Path(root if root is not None else os.environ.get('QPIXELATE_HOME') or default).resolve()
-        self._directory = self.root / 'components'
-        self._preferences_file = self.root / 'component-preferences.json'
+        self._location_file, self._directory, self._archive_directory, self.installer = self._locations()
+        self._preferences_file = self._location_file.parent / 'component-preferences.json'
         catalog = _read_json(self.root / 'component-catalog.json')
         entries = catalog.get('components') if isinstance(catalog, dict) else None
         self.catalog = {key: value for key, value in entries.items()
                         if key in COMPONENTS and isinstance(value, dict)} if isinstance(entries, dict) else {}
         self._verified = {}
+
+    def _locations(self):
+        user_data = _setting_path(os.environ.get('LOCALAPPDATA'))
+        if user_data:
+            registration = user_data / 'Q-Pixelate' / 'installation.json'
+            data = None if _linked(registration) else _read_json(registration)
+            if isinstance(data, dict) and _setting_path(data.get('program_dir')) == self.root:
+                directory = _setting_path(data.get('component_dir'))
+                if directory and directory != self.root:
+                    return (registration, directory, _setting_path(data.get('archive_dir')),
+                            _setting_path(data.get('installer')))
+        portable = self.root / 'component-location.json'
+        data = None if _linked(portable) else _read_json(portable)
+        directory = _setting_path(data.get('component_dir'), self.root) if isinstance(data, dict) else None
+        return portable, directory if directory and directory != self.root else self.root / 'components', None, None
+
+    @property
+    def component_directory(self):
+        return self._directory
 
     def path(self, component):
         if component not in COMPONENTS:
@@ -215,26 +334,102 @@ class ComponentManager:
 
     @contextmanager
     def _mutation(self):
-        try:
-            if _linked(self._directory):
-                raise ComponentError('组件目录必须直接位于发行目录内。')
-            self._directory.mkdir(parents=True, exist_ok=True)
-            lock = self._directory / '.change.lock'
-            if _linked(lock):
-                raise ComponentError('组件锁文件路径无效。')
-            with lock.open('a+b') as handle:
+        with _directory_lock(self._directory):
+            self._check_location()
+            yield
+
+    def _check_location(self):
+        if self._locations()[:2] != (self._location_file, self._directory):
+            raise ComponentError('组件安装位置已更改，请重新启动 Q-Pixelate。')
+
+    def relocate_components(self, destination, runner, *, cleanup=False):
+        runner.report(0, '正在检查组件的新位置…')
+        destination = _setting_path(os.fspath(destination), Path.cwd())
+        if destination is None or _linked(destination):
+            raise ComponentError('请选择有效的组件目录。')
+        original = self._directory
+        if destination == original:
+            return original
+        if (destination == self.root or destination.is_relative_to(original)
+                or original.is_relative_to(destination)):
+            raise ComponentError('新组件目录不能与现有组件目录重叠，也不能是程序安装目录。')
+
+        with self._mutation(), _directory_lock(destination):
+            sources = {}
+            for component in COMPONENTS:
+                for name in (component, self._previous(component).name):
+                    occupied = destination / name
+                    if _exists(occupied):
+                        raise ComponentError(f'目标组件目录已有文件：{occupied}。')
+                source = self.path(component)
+                if not _exists(source) and self._record(component, self._previous(component)) is not None:
+                    self._recover(component)
+                if self._record(component, source) is not None:
+                    sources[component] = source
+
+            candidate = copy(self)
+            candidate._directory = destination
+            source_ffmpeg = self._ffmpeg_selection(runner=runner)[0]
+            with tempfile.TemporaryDirectory(dir=destination, prefix='.move-', ignore_cleanup_errors=True) as workspace:
+                stage = Path(workspace)
+                _copy_components(sources.values(), stage, destination, runner)
+                promoted = []
                 try:
-                    if os.name == 'nt':
-                        import msvcrt
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    else:
-                        import fcntl
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError as error:
-                    raise ComponentError('已有组件变更任务正在运行。') from error
-                yield
-        except OSError as error:
-            raise ComponentError(f'无法修改发行目录 {self.root}，请确认目录可写：{error}') from error
+                    for component in sources:
+                        runner.check()
+                        target = candidate.path(component)
+                        (stage / component).rename(target)
+                        promoted.append(target)
+                    runner.report(75, '正在验证新位置的组件…')
+                    candidate._verify_relocation(sources, source_ffmpeg, runner)
+                    runner.report(95, '正在启用新的组件位置…')
+                    self._check_location()
+                    self._save_component_location(destination, runner)
+                except BaseException:
+                    for target in reversed(promoted):
+                        target.rename(stage / target.name)
+                    raise
+
+            try:
+                if cleanup:
+                    configured = _setting_path(self.preferences()['ffmpeg_directory'])
+                    for component, source in sources.items():
+                        if self._record(component, source) is None:
+                            continue
+                        if configured and configured.is_relative_to(source):
+                            runner.log(f'保留手动指定的 FFmpeg 目录：{configured}。')
+                            continue
+                        try:
+                            self._discard(source)
+                        except OSError as error:
+                            runner.log(f'新位置已启用，无法清理旧组件目录 {source}：{error}')
+            finally:
+                self._directory = destination
+                self._verified.clear()
+        return destination
+
+    def _save_component_location(self, destination, runner):
+        if self._location_file.name == 'installation.json':
+            data = _read_json(self._location_file)
+            if not isinstance(data, dict) or _setting_path(data.get('program_dir')) != self.root:
+                raise ComponentError('无法读取当前安装配置。')
+            data['component_dir'] = str(destination)
+        else:
+            directory = destination.relative_to(self.root) if destination.is_relative_to(self.root) else destination
+            data = {'component_dir': str(directory)}
+        _write_json(self._location_file, data, runner=runner)
+
+    def _verify_relocation(self, sources, source_ffmpeg, runner):
+        for component in sources:
+            runner.check()
+            self._probe(component, self.path(component), runner)
+        for component in (model for model in _MODELS if model in sources):
+            for device in (runtime for runtime in _DEVICES if runtime in sources):
+                self._detector_probe(self.path(device), device, runner, self.path(component) / 'weights.onnx')
+        if source_ffmpeg in ('configured', 'PATH'):
+            new_source = self._ffmpeg_selection(runner=runner)[0]
+            if new_source != source_ffmpeg:
+                raise ComponentError('新位置无法使用原来的 FFmpeg 和 ffprobe。')
 
     def preferences(self):
         stored = _read_json(self._preferences_file)
@@ -248,7 +443,8 @@ class ComponentManager:
     def set_preferences(self, **fields):
         if not fields.keys() <= {'model', 'device', 'ffmpeg_directory'}:
             raise ComponentError('包含未知的组件设置。')
-        with self._mutation():
+        with _directory_lock(self._preferences_file.parent, '.preferences.lock'):
+            self._check_location()
             settings = self.preferences()
             settings.update(fields)
             if settings['model'] not in _MODELS or settings['device'] not in _DEVICES:
@@ -256,14 +452,12 @@ class ComponentManager:
             directory = settings['ffmpeg_directory']
             if directory:
                 path = Path(directory).expanduser().resolve()
-                settings['ffmpeg_directory'] = (path.relative_to(self.root) if path.is_relative_to(self.root)
-                                                else path).as_posix()
+                if self._location_file.name != 'installation.json' and path.is_relative_to(self.root):
+                    path = path.relative_to(self.root)
+                settings['ffmpeg_directory'] = path.as_posix()
             else:
                 settings['ffmpeg_directory'] = None
-            with tempfile.TemporaryDirectory(dir=self.root, prefix='.preferences-') as workspace:
-                pending = Path(workspace) / 'preferences.json'
-                pending.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding='utf-8')
-                pending.replace(self._preferences_file)
+            _write_json(self._preferences_file, settings)
 
     def set_ffmpeg_directory(self, directory):
         self.set_preferences(ffmpeg_directory=directory)
@@ -313,8 +507,12 @@ class ComponentManager:
         if (not isinstance(filename, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*\.zip', filename)
                 or PureWindowsPath(filename).is_reserved()):
             return None
-        path = self.root / filename
-        return path if path.is_file() and not _linked(path) else None
+        for directory in (self.root, self._archive_directory):
+            if directory is not None:
+                path = directory / filename
+                if path.is_file() and not _linked(path):
+                    return path
+        return None
 
     def _check_layout(self, component, directory):
         files = {'base': ('python.exe', 'pythonw.exe', 'app/q_pixelate/__main__.py'),
@@ -406,6 +604,8 @@ class ComponentManager:
                 message = reason
             if tools and origin != 'managed':
                 path = Path(tools['ffmpeg']).parent
+        elif installed and component == 'base' and entry.get('version') and version != entry['version']:
+            message = f'基础运行环境需要从 {version} 更新至 {entry["version"]}。'
         elif installed:
             try:
                 self._check_layout(component, path)

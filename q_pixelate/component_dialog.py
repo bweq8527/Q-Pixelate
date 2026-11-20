@@ -4,9 +4,11 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
-                               QListWidget, QProgressBar, QPushButton, QVBoxLayout)
+                               QLineEdit, QListWidget, QMessageBox, QProgressBar, QPushButton,
+                               QVBoxLayout)
 
 from .jobs import Worker
 
@@ -34,8 +36,23 @@ class ComponentDialog(QDialog):
         self.states = {}
         self.launcher = os.environ.get('QPIXELATE_LAUNCHER', '')
         self.setWindowTitle('设置 · 环境与组件')
-        self.resize(690, 540)
+        self.resize(760, 625)
         layout = QVBoxLayout(self)
+        locations = QFormLayout()
+        self.location_controls = []
+        for label, directory, caption, callback in (
+            ('程序安装位置', manager.root,
+             '更改位置…' if manager.installer else '打开安装包…', self.choose_program_location),
+            ('组件安装位置', manager.component_directory, '更改位置…', self.choose_component_location),
+        ):
+            row = QHBoxLayout()
+            field = QLineEdit(str(directory))
+            field.setReadOnly(True)
+            row.addWidget(field, 1)
+            self.add_button(row, '打开', lambda _checked=False, path=directory: self.open_directory(path))
+            self.location_controls.append(self.add_button(row, caption, callback))
+            locations.addRow(label, row)
+        layout.addLayout(locations)
         self.items = QListWidget()
         self.items.addItems(list(COMPONENTS.values()))
         layout.addWidget(self.items, 2)
@@ -102,6 +119,8 @@ class ComponentDialog(QDialog):
         can_manage = identifier != 'base' or bool(self.launcher)
         for button in (self.refresh, self.external, self.model, self.device, self.done_button):
             button.setEnabled(not busy)
+        for button in self.location_controls:
+            button.setEnabled(not busy and bool(self.launcher))
         self.reset.setEnabled(not busy and bool(self.manager.preferences().get('ffmpeg_directory')))
         self.install.setEnabled(not busy and can_manage and bool(local or entry.get('url')))
         self.install.setText('重新安装' if state.get('installed') else '安装本地包' if local else '下载安装')
@@ -203,6 +222,39 @@ class ComponentDialog(QDialog):
             self.manager.set_ffmpeg_directory(directory)
             return self.read_states(runner)
         self.start_task(task)
+
+    def open_directory(self, directory):
+        if directory.is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+        else:
+            self.status.setText('安装目录尚未创建。')
+
+    def choose_program_location(self):
+        if self.manager.installer:
+            if not self.manager.installer.is_file():
+                self.status.setText('找不到维护安装包，请重新运行 Q-Pixelate-Setup.exe。')
+                return
+            action, path = 'move-program', ''
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, '选择 Q-Pixelate-Setup.exe', str(self.manager.root),
+                                                  'Q-Pixelate 安装包 (Q-Pixelate-Setup.exe)')
+            if not path:
+                return
+            action = 'open-installer'
+        self.accept()
+        self.handoff.emit(action, '', path)
+
+    def choose_component_location(self):
+        folder = QFileDialog.getExistingDirectory(self, '选择组件的新安装位置', str(self.manager.component_directory))
+        if not folder or Path(folder).resolve() == self.manager.component_directory:
+            return
+        cleanup = QMessageBox.question(
+            self, '迁移组件', '迁移成功后，是否清理旧位置中的 Q-Pixelate 组件副本？',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.No)
+        if cleanup != QMessageBox.StandardButton.Cancel:
+            self.accept()
+            self.handoff.emit('move-components', 'cleanup' if cleanup == QMessageBox.StandardButton.Yes else '', folder)
 
     def install_selected(self):
         self.change_component('install')

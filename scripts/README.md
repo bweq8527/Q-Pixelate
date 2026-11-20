@@ -1,5 +1,18 @@
 # Q-Pixelate Windows x64 便携发行
 
+## Windows 安装包
+
+先构建便携发行目录，再使用 Inno Setup 6.3 或更高版本的 `ISCC.exe` 构建 `Q-Pixelate-Setup.exe`。下面的命令用旧版发行清单复用 FFmpeg 和识别组件，只构建新的基础包和启动器。
+
+```powershell
+python scripts/build_portable.py --offline --components base --reuse-catalog dist/portable/component-catalog.json --output dist/windows-0.2.0
+python scripts/build_installer.py --portable dist/windows-0.2.0 --iscc build/inno-tool/compiler/ISCC.exe
+```
+
+安装包默认生成在 `--portable` 指定的发行目录。把配套 ZIP 与安装包放在一起即可离线安装。安装向导可分别指定程序和组件位置，安装后可在「设置 → 环境与组件」更改。默认程序目录是 `%LOCALAPPDATA%\Programs\Q-Pixelate`，组件目录是 `%LOCALAPPDATA%\Q-Pixelate\components`。卸载默认保留组件和用户文件。
+
+## 直接运行便携版
+
 将 `Q-Pixelate.exe` 和 `component-catalog.json` 放在同一个可写目录中，双击启动器。首次启动会检测视频编辑环境，并勾选缺少的基础组件。选择「下载安装所选项」安装，检测通过后点击「打开编辑器」。离线安装时，将清单 `archive` 字段对应的 ZIP 放在启动器旁，点击「安装所选项」。也可以单选一个组件，再点击「导入离线包」选择 ZIP。
 
 编辑器内的「设置 → 环境与组件」可管理组件和模型。已安装所需组件后，启动与识别均可离线运行。搬迁程序时复制整个目录，`components` 和 `component-preferences.json` 保留在启动器旁边。视频工程素材与贴纸库沿用编辑器原有路径规则。

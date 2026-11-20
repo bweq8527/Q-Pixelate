@@ -29,13 +29,31 @@ class LaunchOptions(NamedTuple):
     wait_pid: int | None
     editor_args: list[str]
     setup: bool
+    component_directory: Path | None
+    cleanup: bool
+    relocate_program: bool
+    start_installer: Path | None
+    remove_components: bool
+    verify_installation: bool
+
+    @property
+    def maintenance(self):
+        return bool(self.action or self.component_directory or self.relocate_program
+                    or self.start_installer or self.remove_components)
 
 
 def parse_options(arguments, working_directory):
     parser = argparse.ArgumentParser(prog='Q-Pixelate.exe')
     parser.add_argument('--setup', action='store_true')
     parser.add_argument('--wait-pid', type=int)
-    parser.add_argument('--component-action', nargs='+', metavar='ACTION')
+    operations = parser.add_mutually_exclusive_group()
+    operations.add_argument('--component-action', nargs='+', metavar='ACTION')
+    operations.add_argument('--move-components', metavar='DIRECTORY')
+    operations.add_argument('--relocate-program', action='store_true')
+    operations.add_argument('--start-installer', metavar='FILE')
+    operations.add_argument('--remove-installed-components', action='store_true')
+    operations.add_argument('--verify-installation', action='store_true')
+    parser.add_argument('--remove-old-copy', action='store_true')
     if '--' in arguments:
         boundary = arguments.index('--')
         options, editor_args = parser.parse_known_args(arguments[:boundary])
@@ -53,9 +71,15 @@ def parse_options(arguments, working_directory):
         action = (kind, component, archive)
     if options.wait_pid is not None and not 0 < options.wait_pid <= 0xFFFFFFFF:
         parser.error('--wait-pid must be a Windows process ID')
+    if options.remove_old_copy and not options.move_components:
+        parser.error('--remove-old-copy requires --move-components')
     if editor_args and not editor_args[0].startswith('-'):
         editor_args[0] = str((working_directory / editor_args[0]).resolve())
-    return LaunchOptions(action, options.wait_pid, editor_args, options.setup)
+    component_directory = (working_directory / options.move_components).resolve() if options.move_components else None
+    installer = (working_directory / options.start_installer).resolve() if options.start_installer else None
+    return LaunchOptions(action, options.wait_pid, editor_args, options.setup,
+                         component_directory, options.remove_old_copy, options.relocate_program,
+                         installer, options.remove_installed_components, options.verify_installation)
 
 
 def wait_for_editor(pid, runner):
@@ -151,8 +175,12 @@ class SetupWindow:
         for button in (self.install_button, self.offline_button, self.refresh_button, self.cancel_button):
             button.pack(side='left', padx=(0, 6))
         self.open_button.pack(side='right')
+        self.location = ttk.Label(container, wraplength=455)
+        self.location.grid(row=10, column=0, columnspan=2, sticky='w', pady=(12, 0))
+        self.location_button = ttk.Button(container, text='更改组件位置…', command=self.choose_location)
+        self.location_button.grid(row=11, column=0, sticky='w', pady=(5, 0))
         window.after(60, self.poll)
-        if options.action:
+        if options.maintenance:
             self.start_task(self.apply_handoff, auto_open=True)
         else:
             self.start_task(lambda runner: self.verify_components(runner, REQUIRED), auto_open=not options.setup)
@@ -177,6 +205,14 @@ class SetupWindow:
         self.refresh_button.configure(state='disabled' if self.busy else 'normal')
         self.cancel_button.configure(state='normal' if self.busy else 'disabled')
         self.open_button.configure(state='normal' if self.editor_ready() and not self.busy else 'disabled')
+        self.location_button.configure(state='disabled' if self.busy else 'normal')
+        self.location.configure(text=f'组件安装位置  {self.manager.component_directory}')
+
+    def choose_location(self):
+        folder = filedialog.askdirectory(parent=self.window, title='选择组件的新安装位置',
+                                         initialdir=str(self.manager.component_directory))
+        if folder and Path(folder).resolve() != self.manager.component_directory:
+            self.start_task(lambda runner: self.manager.relocate_components(Path(folder), runner))
 
     def start_task(self, operation, *, auto_open=False):
         from q_pixelate.process import Runner
@@ -261,6 +297,9 @@ class SetupWindow:
     def apply_handoff(self, runner):
         if self.options.wait_pid:
             wait_for_editor(self.options.wait_pid, runner)
+        if self.options.component_directory:
+            self.manager.relocate_components(self.options.component_directory, runner, cleanup=self.options.cleanup)
+            return
         kind, component, archive = self.options.action
         if kind == 'uninstall':
             runner.report(0, f'正在卸载 {TITLES[component]}…')
@@ -308,16 +347,47 @@ class SetupWindow:
 
 def main():
     from q_pixelate.components import ComponentManager
+    from q_pixelate.process import Runner
 
+    options = parse_options(sys.argv[1:], Path.cwd())
+    frozen = getattr(sys, 'frozen', False)
+    launcher_path = Path(sys.executable if frozen else __file__).resolve()
+    root = launcher_path.parent if frozen else os.environ.get('QPIXELATE_HOME', launcher_path.parent)
+    if options.verify_installation or options.remove_components:
+        try:
+            manager = ComponentManager(root)
+            if not manager.installer or not manager.installer.is_file():
+                return 1
+            if options.verify_installation:
+                return 0 if all(component in manager.catalog for component in REQUIRED) else 1
+            prepare_frozen_environment()
+            if options.wait_pid:
+                wait_for_editor(options.wait_pid, Runner())
+            for component in reversed(TITLES):
+                if manager.status(component)['installed']:
+                    manager.uninstall(component)
+            return 0
+        except (OSError, ValueError, RuntimeError):
+            return 1
     window = tk.Tk()
     window.withdraw()
     try:
-        options = parse_options(sys.argv[1:], Path.cwd())
-        frozen = getattr(sys, 'frozen', False)
-        launcher_path = Path(sys.executable if frozen else __file__).resolve()
         prepare_frozen_environment()
-        manager = ComponentManager(launcher_path.parent if frozen else
-                                   os.environ.get('QPIXELATE_HOME', launcher_path.parent))
+        manager = ComponentManager(root)
+        if options.relocate_program or options.start_installer:
+            if options.wait_pid:
+                wait_for_editor(options.wait_pid, Runner())
+            installer = manager.installer if options.relocate_program else options.start_installer
+            if not installer or not installer.is_file():
+                raise ValueError('找不到 Q-Pixelate 安装包。')
+            if not options.relocate_program and installer.name.casefold() != 'q-pixelate-setup.exe':
+                raise ValueError('请选择 Q-Pixelate-Setup.exe 安装包。')
+            command = [str(installer)]
+            if options.relocate_program:
+                command.append('/RELOCATE=1')
+            subprocess.Popen(command, cwd=installer.parent)
+            window.destroy()
+            return 0
         SetupWindow(window, manager, options)
     except (OSError, ValueError, RuntimeError) as error:
         messagebox.showerror('Q-Pixelate', str(error), parent=window)
