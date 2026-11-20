@@ -5,6 +5,8 @@ from pathlib import Path
 from PySide6.QtCore import QStandardPaths
 from PySide6.QtGui import QImageReader
 
+STICKER_MIME = 'application/x-qpixel-sticker'
+
 
 class StickerLibrary:
     def __init__(self, root=None):

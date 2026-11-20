@@ -1,0 +1,221 @@
+from PySide6.QtCore import QMimeData, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPen
+from PySide6.QtWidgets import (
+    QAbstractItemView, QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
+)
+
+from .widgets import TimeSpinBox
+from .stickers import STICKER_MIME
+
+
+class StickerList(QListWidget):
+    asset_role = Qt.ItemDataRole.UserRole
+
+    def __init__(self):
+        super().__init__()
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.setViewMode(QListWidget.ViewMode.IconMode)
+        self.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.setIconSize(QSize(42, 42))
+        self.setGridSize(QSize(92, 66))
+        self.setMinimumHeight(92)
+        self.setToolTip('将缩略图拖到视频画面，或用于当前遮罩')
+
+    def add_asset(self, path, name):
+        item = QListWidgetItem(QIcon(path), name)
+        item.setToolTip(name)
+        item.setData(self.asset_role, path)
+        self.addItem(item)
+
+    def find_asset(self, path):
+        return next((self.item(i) for i in range(self.count()) if self.item(i).data(self.asset_role) == path), None)
+
+    def startDrag(self, actions):
+        item = self.currentItem()
+        if item is None:
+            return
+        mime = QMimeData()
+        mime.setData(STICKER_MIME, item.data(self.asset_role).encode('utf-8'))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(item.icon().pixmap(54, 54))
+        drag.exec(Qt.DropAction.CopyAction)
+
+
+class LayerInspector(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.picker = QComboBox()
+        layout.addWidget(self.picker)
+        row = QHBoxLayout()
+        self.draw = QPushButton('绘制遮罩')
+        self.full_blur = QPushButton('＋全屏模糊')
+        self.shape = QComboBox()
+        for label, value in [('方框', 'rect'), ('椭圆', 'ellipse'), ('套索', 'lasso')]:
+            self.shape.addItem(label, value)
+        for widget in (self.draw, self.shape, self.full_blur):
+            row.addWidget(widget)
+        layout.addLayout(row)
+        self.redraw = QPushButton('绘制 / 重绘本层遮罩')
+        layout.addWidget(self.redraw)
+        row = QHBoxLayout()
+        self.lower = QPushButton('下移')
+        self.raise_ = QPushButton('上移')
+        self.delete = QPushButton('删除图层')
+        for widget in (self.lower, self.raise_, self.delete):
+            row.addWidget(widget)
+        layout.addLayout(row)
+        self.details = QWidget()
+        form = QFormLayout(self.details)
+        form.setContentsMargins(0, 0, 0, 0)
+        self.name = QLineEdit()
+        form.addRow('图层名称', self.name)
+        self.start, self.end = TimeSpinBox(), TimeSpinBox()
+        form.addRow('图层入点', self.start)
+        form.addRow('图层出点', self.end)
+        self.kind = QComboBox()
+        self.kind.addItem('模糊', 'blur')
+        self.kind.addItem('贴纸', 'sticker')
+        form.addRow('遮罩用途', self.kind)
+        self.asset = QPushButton('使用素材库选中的贴纸')
+        form.addRow(self.asset)
+        self.target = QComboBox()
+        self.target.addItem('贴纸', 'sticker')
+        self.target.addItem('遮罩', 'mask')
+        form.addRow('变换对象', self.target)
+        self.remove_mask = QPushButton('移除贴纸遮罩')
+        form.addRow(self.remove_mask)
+        self.strength = self.spin(1, 100, 0)
+        self.feather = self.spin(0, 20)
+        self.feather.setSuffix(' %')
+        form.addRow('模糊强度', self.strength)
+        form.addRow('向内羽化', self.feather)
+        self.geometry = []
+        for name, lo, hi in [('中心 X %', -400, 500), ('中心 Y %', -400, 500),
+                             ('宽度 %', .01, 800), ('高度 %', .01, 800), ('角度 °', -180, 180)]:
+            spin = self.spin(lo, hi)
+            form.addRow(name, spin)
+            self.geometry.append(spin)
+        self.transform = QPushButton('自由变换 Ctrl+T')
+        form.addRow(self.transform)
+        layout.addWidget(self.details)
+
+    @staticmethod
+    def spin(lo, hi, decimals=2):
+        spin = QDoubleSpinBox()
+        spin.setRange(lo, hi)
+        spin.setDecimals(decimals)
+        spin.setKeyboardTracking(False)
+        return spin
+
+
+class LayerTimeline(QWidget):
+    activated = Signal(int)
+    dragged = Signal(int, float, float)
+    row_height = 24
+
+    def __init__(self, timeline):
+        super().__init__()
+        self.timeline = timeline
+        self.edit = None
+        self.selected = -1
+        self.drag = None
+        self.candidate = None
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setToolTip('拖动图层内部移动时间，拖动两端调整时长')
+
+    def set_edit(self, edit, selected):
+        self.edit, self.selected = edit, selected
+        self.setMinimumHeight(max(1, len(edit.layers) if edit else 0)*self.row_height)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor('#131923'))
+        if not self.edit or not self.edit.layers:
+            painter.setPen(QColor('#9aacc2'))
+            painter.drawText(20, 17, '图层轨 · 将贴纸拖入画面，或绘制遮罩')
+            return
+        for index in range(max(0, event.rect().top()//self.row_height),
+                           min(len(self.edit.layers), event.rect().bottom()//self.row_height+1)):
+            layer = self.edit.layers[index]
+            y = index*self.row_height
+            area = QRectF(20, y+2, self.width()-39, self.row_height-3)
+            painter.fillRect(area, QColor('#29394e' if index == self.selected else '#202b3a'))
+            painter.save()
+            painter.setClipRect(area)
+            start, end = self.candidate if self.drag and self.drag[0] == index else self.edit.layer_span(layer)
+            if start < end:
+                left, right = (self.timeline.point_for_time(t).x() for t in (start, end))
+                color = QColor('#7864a6' if layer.kind == 'sticker' else '#317569')
+                painter.fillRect(QRectF(left, y+3, max(2, right-left), self.row_height-5), color)
+                if index == self.selected:
+                    painter.setPen(QPen(QColor('#d5fff1'), 1))
+                    painter.drawRect(QRectF(left, y+3, max(2, right-left), self.row_height-5))
+            painter.setPen(QColor('#e5edf8'))
+            text = layer.name or ('贴纸' if layer.kind == 'sticker' else '模糊')
+            painter.drawText(26, y+17, f'{index+1:02}  {text}' + (' · 范围外' if start >= end else ''))
+            painter.restore()
+        x = self.timeline.point_for_time(self.timeline.position).x()
+        if 20 <= x <= self.width()-19:
+            painter.setPen(QPen(QColor('#ffb86b'), 1, Qt.PenStyle.DotLine))
+            painter.drawLine(x, 0, x, len(self.edit.layers)*self.row_height)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton or not self.edit:
+            return
+        index = int(event.position().y())//self.row_height
+        if not 0 <= index < len(self.edit.layers):
+            return
+        self.setFocus()
+        self.activated.emit(index)
+        if self.edit.locked:
+            return
+        a, b = self.edit.layer_span(self.edit.layers[index])
+        if a >= b:
+            return
+        x = event.position().x()
+        left, right = (self.timeline.point_for_time(t).x() for t in (a, b))
+        tolerance = min(7, max(1, (right-left)*.23))
+        if abs(x-left) <= tolerance:
+            mode = 'left'
+        elif abs(x-right) <= tolerance:
+            mode = 'right'
+        elif left < x < right:
+            mode = 'move'
+        else:
+            return
+        self.drag = (index, mode, self.timeline.time_at(x), a, b)
+        self.candidate = (a, b)
+
+    def mouseMoveEvent(self, event):
+        if not self.drag:
+            return
+        _, mode, anchor, a, b = self.drag
+        delta = self.timeline.time_at(event.position().x())-anchor
+        lo, hi = self.edit.start, self.edit.end
+        minimum = min(b-a, self.timeline.minimum_span)
+        if mode == 'left':
+            a = max(lo, min(b-minimum, a+delta))
+        elif mode == 'right':
+            b = min(hi, max(a+minimum, b+delta))
+        else:
+            delta = max(lo-a, min(hi-b, delta))
+            a, b = a+delta, b+delta
+        self.candidate = a, b
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton or not self.drag:
+            return
+        self.mouseMoveEvent(event)
+        index, _, _, a, b = self.drag
+        candidate = self.candidate
+        self.drag = self.candidate = None
+        if candidate != (a, b):
+            self.dragged.emit(index, *candidate)
+        self.update()

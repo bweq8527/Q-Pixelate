@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .media import index_video, probe
-from .model import Project, plan_ranges, frame_bounds
+from .model import Project, plan_ranges, frame_bounds, legacy_image_box
 from .process import Runner
-from .masks import mask_image
+from .masks import mask_image, raster_layer
 
 
 FFMPEG = ['ffmpeg', '-hide_banner', '-v', 'warning', '-nostdin', '-y']
@@ -53,53 +52,104 @@ def require_idr(info, frame, runner):
     raise ValueError('拼接边界不是独立 IDR 帧，可能使用了开放 GOP；首版拒绝快速拼接以免重复或丢失画面。')
 
 
-def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed=1):
+def effect_intervals(edits):
+    for edit in edits:
+        if edit.layers is None:
+            yield edit, None
+            continue
+        for layer in edit.layers:
+            start, end = edit.layer_span(layer)
+            if start < end:
+                effect = 'image' if layer.kind == 'sticker' else 'region' if layer.mask else 'blur'
+                yield replace(edit, start=start, end=end, effect=effect, strength=layer.strength,
+                              feather=layer.mask.feather if layer.mask else 0), layer
+
+
+def encoding_intervals(edits, fps):
+    # Legacy projects retain their existing spans. Layered projects only encode
+    # the GOPs containing an actual effect or a speed change.
+    intervals = [edit for edit in edits if edit.layers is None or edit.speed != 1]
+    intervals.extend(edit for edit, layer in effect_intervals(edits)
+                     if layer is not None and frame_bounds(edit, fps)[0] < frame_bounds(edit, fps)[1])
+    return intervals
+
+
+def sample_aspect(info):
+    try:
+        x, y = map(int, info.video.get('sample_aspect_ratio', '1:1').split(':'))
+        return x/y if x > 0 and y > 0 else 1
+    except ValueError:
+        return 1
+
+
+def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed=1,
+                 *, stop=None, pixel_aspect=1):
     """Stage assets under safe names; user paths never appear inside filter syntax."""
     graph = ['[0:v:0]setpts=PTS-STARTPTS[v0]']
     inputs = []
     image_index = 0
-    for i, edit in enumerate(edits):
+    offset_frame = round(offset * fps)
+    effects = [(edit, layer) for edit, layer in effect_intervals(edits)
+               if edit.end > offset and (stop is None or edit.start < stop)]
+
+    def add_input(asset):
+        nonlocal image_index
+        image_index += 1
+        inputs.extend(['-loop', '1', '-framerate', str(fps), '-i', str(asset)])
+        return image_index
+
+    def add_mask(i, edit, layer, pixel_format):
+        asset = workspace / f'mask-{i}.png'
+        image = raster_layer(layer, width, height, pixel_aspect, mask=True) if layer else mask_image(edit, width, height)
+        if not image.save(str(asset)):
+            raise ValueError('无法写入遮罩。')
+        index = add_input(asset)
+        graph.append(f'[{index}:v]format={pixel_format}[maskraw{i}]')
+        if not edit.feather:
+            return f'maskraw{i}'
+        sigma = max(.1, edit.feather*min(width, height)/100/3)
+        graph.extend([f'[maskraw{i}]split[hard{i}][soft{i}]',
+                      f'[soft{i}]gblur=sigma={sigma:.6f}[feather{i}]',
+                      f'[hard{i}][feather{i}]blend=all_mode=multiply[mask{i}]'])
+        return f'mask{i}'
+
+    for i, (edit, layer) in enumerate(effects):
         before, after = f'v{i}', f'v{i+1}'
         first, last = frame_bounds(edit, fps)
-        offset_frame = round(offset * fps)
         enable = f"gte(n,{first-offset_frame})*lt(n,{last-offset_frame})"
         radius = max(1, min(edit.strength, width // 4, height // 4))
-        rect = edit.rect
-        x = min(width-2, int(rect.x * width) // 2 * 2)
-        y = min(height-2, int(rect.y * height) // 2 * 2)
-        right = min(width, math.ceil((rect.x+rect.w)*width/2-1e-9)*2)
-        bottom = min(height, math.ceil((rect.y+rect.h)*height/2-1e-9)*2)
-        w, h = max(2, right-x), max(2, bottom-y)
         if edit.effect == 'blur':
             graph.append(f"[{before}]boxblur=luma_radius={radius}:luma_power=2:chroma_radius={max(1, radius//2)}:enable='{enable}'[{after}]")
         elif edit.effect == 'region':
-            image_index += 1
-            asset = workspace / f'mask-{i}.png'
-            if not mask_image(edit, width, height).save(str(asset)):
-                raise ValueError('无法写入遮罩。')
-            inputs += ['-loop', '1', '-framerate', str(fps), '-i', str(asset)]
+            mask = add_mask(i, edit, layer, 'gbrp')
             graph.extend([f'[{before}]format=gbrp,split[base{i}][crop{i}]',
-                          f'[crop{i}]boxblur={radius}:2[blur{i}]',
-                          f'[{image_index}:v]format=gbrp[maskraw{i}]'])
-            if edit.feather:
-                sigma = max(.1, edit.feather*min(width, height)/100/3)
-                graph.extend([f'[maskraw{i}]split[hard{i}][soft{i}]',
-                              f'[soft{i}]gblur=sigma={sigma:.6f}[feather{i}]',
-                              f'[hard{i}][feather{i}]blend=all_mode=multiply[mask{i}]'])
+                          f'[crop{i}]boxblur={radius}:2[blur{i}]'])
+            graph.append(f"[base{i}][blur{i}][{mask}]maskedmerge=enable='{enable}'[{after}]")
+        elif edit.effect == 'image' and layer is not None:
+            asset = workspace / f'layer-{i}.png'
+            if not raster_layer(layer, width, height, pixel_aspect).save(str(asset)):
+                raise ValueError('无法写入贴纸图层。')
+            index = add_input(asset)
+            if layer.mask:
+                mask = add_mask(i, edit, layer, 'gray')
+                graph.extend([f'[{index}:v]format=rgba,split[sticker{i}][alpha_source{i}]',
+                              f'[alpha_source{i}]alphaextract[alpha{i}]',
+                              f'[alpha{i}][{mask}]blend=all_mode=multiply[clipped{i}]',
+                              f'[sticker{i}][clipped{i}]alphamerge[image{i}]'])
             else:
-                graph.append(f'[maskraw{i}]null[mask{i}]')
-            graph.append(f"[base{i}][blur{i}][mask{i}]maskedmerge=enable='{enable}'[{after}]")
+                graph.append(f'[{index}:v]format=rgba[image{i}]')
+            graph.append(f"[{before}][image{i}]overlay=0:0:enable='{enable}':shortest=1[{after}]")
         elif edit.effect == 'image':
-            image_index += 1
+            x, y, w, h = legacy_image_box(edit.rect, width, height)
             suffix = Path(edit.image).suffix.lower()
             asset = workspace / f'asset-{i}{suffix}'
             shutil.copyfile(edit.image, asset)
-            inputs += ['-loop', '1', '-framerate', str(fps), '-i', str(asset)]
-            graph.extend([f'[{image_index}:v]scale={w}:{h},format=rgba[image{i}]',
+            index = add_input(asset)
+            graph.extend([f'[{index}:v]scale={w}:{h},format=rgba[image{i}]',
                           f"[{before}][image{i}]overlay={x}:{y}:enable='{enable}':shortest=1[{after}]"])
         else:
             graph.append(f'[{before}]null[{after}]')
-    last = f'v{len(edits)}'
+    last = f'v{len(effects)}'
     if speed != 1:
         graph.append(f'[{last}]setpts=(PTS-STARTPTS)/{speed:.12f},fps={fps}[retimed]')
         last = 'retimed'
@@ -185,8 +235,7 @@ class Exporter:
         runner.check()
         project.check_source()
         destination = Path(destination).resolve()
-        protected = [Path(project.source).resolve()] + [Path(e.image).resolve() for e in project.edits if e.image]
-        if destination in protected:
+        if destination in project.asset_paths():
             raise ValueError('输出不能覆盖源视频或遮挡素材。')
         if destination.suffix.lower() not in ('.mp4', '.mkv'):
             raise ValueError('请选择 MP4 或 MKV 输出文件。')
@@ -194,7 +243,8 @@ class Exporter:
             raise ValueError('输出文件已存在，请选择新路径或明确确认覆盖。')
         info = probe(project.source, runner)
         project.validate(info.duration)
-        if project.edits and info.fast_mode_error():
+        intervals = encoding_intervals(project.edits, info.fps_float)
+        if intervals and info.fast_mode_error():
             raise ValueError(info.fast_mode_error())
         # Only preserve tracks the destination container can hold without transcoding.
         if destination.suffix.lower() == '.mp4' and any(a.get('codec_name') not in ('aac', 'mp3', 'ac3', 'eac3', 'alac') for a in info.audio):
@@ -204,7 +254,7 @@ class Exporter:
         with tempfile.TemporaryDirectory(prefix='.qpixel-', dir=destination.parent) as directory:
             work = Path(directory)
             pending = work / ('result' + destination.suffix)
-            if not project.edits:
+            if not intervals:
                 runner.report(10, '没有修订片段，正在直接复制视频和音频…')
                 runner.run(FFMPEG + ['-i', info.path, '-map', f'0:{info.video["index"]}', '-map', '0:a?',
                                     '-c', 'copy', '-avoid_negative_ts', 'disabled', '-progress', 'pipe:1', str(pending)], info.duration, 10, 85)
@@ -212,7 +262,7 @@ class Exporter:
                 encoded = 0
             else:
                 index = index_video(info, runner)
-                spans = plan_ranges(project.edits, index.keyframes, index.frames, info.fps_float)
+                spans = plan_ranges(intervals, index.keyframes, index.frames, info.fps_float)
                 for span in spans:
                     require_idr(info, span.start, runner)
                 encoded = sum(s.end-s.start for s in spans if s.encode) / info.fps_float
@@ -236,7 +286,8 @@ class Exporter:
                     if encode:
                         edits = [e for e in project.edits if e.start < last/info.fps_float and e.end > start]
                         inputs, graph = effect_graph(edits, info.width, info.height, start, work, info.fps_float,
-                                                     speed=count/result_count)
+                                                     speed=count/result_count, stop=last/info.fps_float,
+                                                     pixel_aspect=sample_aspect(info))
                         args += inputs + ['-filter_complex', graph, '-map', '[out]'] + _encoder(info)
                     else:
                         if first:
@@ -311,7 +362,8 @@ def render_preview(project: Project, edit_index: int, destination, runner: Runne
     with tempfile.TemporaryDirectory(prefix='qpixel-preview-') as directory:
         count = output_frames(first, last, edit.speed)
         effective = (last-first)/count
-        inputs, graph = effect_graph([edit], info.width, info.height, start, Path(directory), info.fps_float, 960, effective)
+        inputs, graph = effect_graph([edit], info.width, info.height, start, Path(directory), info.fps_float, 960, effective,
+                                     stop=last/info.fps_float, pixel_aspect=sample_aspect(info))
         audio_maps = ['-map', '0:a?']
         if edit.speed != 1 and info.audio:
             # Input seek resets timestamps; express the preview edit on that local timeline.

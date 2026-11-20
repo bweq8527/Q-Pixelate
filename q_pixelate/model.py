@@ -5,6 +5,7 @@ import json
 import math
 import os
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -24,6 +25,74 @@ class Rect:
             raise ValueError('遮挡区域必须位于画面内，且宽高大于零。')
 
 
+def legacy_image_box(rect, width, height):
+    """Match the coded-pixel overlay bounds used by v1/v2 projects."""
+    x = min(width-2, int(rect.x * width) // 2 * 2)
+    y = min(height-2, int(rect.y * height) // 2 * 2)
+    right = min(width, math.ceil((rect.x+rect.w)*width/2-1e-9)*2)
+    bottom = min(height, math.ceil((rect.y+rect.h)*height/2-1e-9)*2)
+    return x, y, max(2, right-x), max(2, bottom-y)
+
+
+@dataclass
+class Transform:
+    x: float = .5
+    y: float = .5
+    w: float = .5
+    h: float = .5
+    angle: float = 0
+
+    @classmethod
+    def from_rect(cls, rect):
+        return cls(rect.x + rect.w / 2, rect.y + rect.h / 2, rect.w, rect.h)
+
+    def validate(self):
+        values = (self.x, self.y, self.w, self.h, self.angle)
+        if (any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in values)
+                or not (-4 <= self.x <= 5 and -4 <= self.y <= 5)
+                or not (0 < self.w <= 8 and 0 < self.h <= 8)):
+            raise ValueError('图层变换无效。')
+
+
+@dataclass
+class Mask:
+    shape: str = 'rect'
+    transform: Transform = field(default_factory=Transform)
+    points: list[tuple[float, float]] = field(default_factory=list)
+    feather: float = 0
+
+    def validate(self):
+        self.transform.validate()
+        Edit(0, 1, 'region', shape=self.shape, points=self.points, feather=self.feather).validate(1)
+
+
+@dataclass
+class Layer:
+    start: float
+    end: float
+    kind: str = 'blur'
+    name: str = ''
+    image: str = ''
+    transform: Transform = field(default_factory=Transform)
+    mask: Mask | None = None
+    strength: int = 20
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def validate(self):
+        if (any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in (self.start, self.end))
+                or self.start >= self.end):
+            raise ValueError('图层时间范围无效。')
+        if self.kind not in ('blur', 'sticker') or not isinstance(self.name, str) or not isinstance(self.id, str) or not self.id:
+            raise ValueError('图层类型或名称无效。')
+        if not isinstance(self.strength, int) or not 1 <= self.strength <= 100:
+            raise ValueError('模糊强度须为 1–100。')
+        if not isinstance(self.image, str) or (self.kind == 'sticker' and not Path(self.image).is_file()):
+            raise ValueError('贴纸图片不存在，请重新选择素材。')
+        self.transform.validate()
+        if self.mask is not None:
+            self.mask.validate()
+
+
 @dataclass
 class Edit:
     start: float
@@ -38,6 +107,34 @@ class Edit:
     feather: float = 0
     range_locked: bool = False
     locked: bool = False
+    layers: list[Layer] | None = None
+
+    def promote_layers(self, width, height):
+        if self.layers is not None:
+            return
+        self.layers = []
+        if self.effect == 'none':
+            return
+        transform = Transform.from_rect(self.rect)
+        mask = None
+        if self.effect == 'image':
+            x, y, w, h = legacy_image_box(self.rect, width, height)
+            transform = Transform.from_rect(Rect(x/width, y/height, w/width, h/height))
+        elif self.effect == 'region':
+            if self.shape == 'lasso':
+                xs, ys = zip(*self.points)
+                bounds = Rect(min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys))
+                transform = Transform.from_rect(bounds)
+                points = [((x-bounds.x)/bounds.w, (y-bounds.y)/bounds.h) for x, y in self.points]
+            else:
+                points = []
+            mask = Mask(self.shape, transform, points, self.feather)
+        self.layers.append(Layer(0, self.end-self.start, 'sticker' if self.effect == 'image' else 'blur',
+                                 {'blur': '全屏模糊', 'region': '区域模糊', 'image': '贴纸'}[self.effect],
+                                 self.image, transform, mask, self.strength))
+
+    def layer_span(self, layer):
+        return max(self.start, self.start + layer.start), min(self.end, self.start + layer.end)
 
     def validate(self, duration: float):
         if (any(not isinstance(t, (int, float)) or not math.isfinite(t) for t in (self.start, self.end))
@@ -47,12 +144,20 @@ class Edit:
             raise ValueError('未知的遮挡效果。')
         if not isinstance(self.speed, (int, float)) or not math.isfinite(self.speed) or not .25 <= self.speed <= 4:
             raise ValueError('片段速度须为 0.25–4 倍。')
+        if not isinstance(self.range_locked, bool) or not isinstance(self.locked, bool):
+            raise ValueError('片段锁定状态无效。')
+        if self.layers is not None:
+            ids = set()
+            for layer in self.layers:
+                layer.validate()
+                if layer.id in ids:
+                    raise ValueError('片段包含重复的图层标识。')
+                ids.add(layer.id)
+            return
         if self.shape not in ('rect', 'ellipse', 'lasso'):
             raise ValueError('未知的遮罩形状。')
         if not isinstance(self.feather, (int, float)) or not math.isfinite(self.feather) or not 0 <= self.feather <= 20:
             raise ValueError('羽化范围须为 0–20%。')
-        if not isinstance(self.range_locked, bool) or not isinstance(self.locked, bool):
-            raise ValueError('片段锁定状态无效。')
         if not isinstance(self.points, list):
             raise ValueError('套索路径无效。')
         for point in self.points:
@@ -77,6 +182,12 @@ class Project:
     source: str
     edits: list[Edit] = field(default_factory=list)
     fingerprint: dict = field(default_factory=dict)
+
+    def asset_paths(self):
+        yield Path(self.source).resolve()
+        for edit in self.edits:
+            images = [layer.image for layer in edit.layers] if edit.layers is not None else [edit.image]
+            yield from (Path(image).resolve() for image in images if image)
 
     def validate(self, duration=float('inf')):
         if not isinstance(self.source, str) or not self.source:
@@ -108,8 +219,18 @@ class Project:
                 return os.path.relpath(Path(value).resolve(), path.parent)
             except ValueError:
                 return str(Path(value).resolve())
-        edits = [asdict(e) | {'image': relative(e.image)} for e in self.edits]
-        data = {'version': 2, 'source': relative(self.source),
+        edits = []
+        for edit in self.edits:
+            raw = asdict(edit)
+            if edit.layers is None:
+                raw.pop('layers')
+                raw['image'] = relative(edit.image)
+            else:
+                raw = {key: raw[key] for key in ('start', 'end', 'speed', 'locked', 'range_locked', 'layers')}
+                for layer in raw['layers']:
+                    layer['image'] = relative(layer['image'])
+            edits.append(raw)
+        data = {'version': 3 if any(e.layers is not None for e in self.edits) else 2, 'source': relative(self.source),
                 'fingerprint': self.fingerprint, 'edits': edits}
         name = None
         try:
@@ -127,7 +248,7 @@ class Project:
         path = Path(path).resolve()
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
-            if not isinstance(data, dict) or data.get('version') not in (1, 2):
+            if not isinstance(data, dict) or data.get('version') not in (1, 2, 3):
                 raise ValueError('工程格式或版本不受支持。')
             def absolute(value):
                 if not isinstance(value, str):
@@ -136,6 +257,20 @@ class Project:
             edits = []
             for raw in data['edits']:
                 raw = dict(raw)
+                if 'layers' in raw:
+                    layers = []
+                    for item in raw['layers']:
+                        item = dict(item)
+                        item['image'] = absolute(item.get('image', ''))
+                        item['transform'] = Transform(**item.get('transform', {}))
+                        if item.get('mask') is not None:
+                            mask = dict(item['mask'])
+                            mask['transform'] = Transform(**mask.get('transform', {}))
+                            mask['points'] = [tuple(p) for p in mask.get('points', [])]
+                            item['mask'] = Mask(**mask)
+                        layers.append(Layer(**item))
+                    edits.append(Edit(effect='none', **(raw | {'layers': layers})))
+                    continue
                 raw['rect'] = Rect(**raw.get('rect', {}))
                 raw['image'] = absolute(raw.get('image', ''))
                 if isinstance(raw.get('points', []), list):

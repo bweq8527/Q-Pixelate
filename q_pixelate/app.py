@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, QSignalBlocker, QTimer, QEvent
@@ -13,11 +14,13 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QPushButton,
-    QProgressBar, QScrollArea, QScrollBar, QSlider, QSplitter, QTextEdit,
+    QProgressBar, QScrollArea, QScrollBar, QSlider, QSplitter, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget, QAbstractSpinBox, QLineEdit,
 )
 
 from .jobs import Worker
+from .layer_editor import LayerEditing
+from .layer_widgets import LayerInspector, LayerTimeline, StickerList
 from .media import probe
 from .model import Edit, Project, Rect
 from .render import Exporter, render_preview
@@ -42,7 +45,7 @@ QPushButton#danger { color: #f1acac; }
 QListWidget, QTextEdit { background: #111923; border: 1px solid #304057; border-radius: 6px; padding: 5px; }
 QListWidget::item { padding: 9px 5px; border-radius: 4px; }
 QListWidget::item:selected { background: #284d49; color: #b8ffe7; }
-QDoubleSpinBox, QComboBox { background: #101923; border: 1px solid #35465c; border-radius: 5px; padding: 5px; }
+QDoubleSpinBox, QComboBox, QLineEdit { background: #101923; border: 1px solid #35465c; border-radius: 5px; padding: 5px; }
 QComboBox QAbstractItemView { background: #1b2939; selection-background-color: #315f56; }
 QSlider::groove:horizontal { background: #2e3c50; height: 5px; border-radius: 2px; }
 QSlider::handle:horizontal { background: #73dfbc; width: 12px; margin: -4px 0; border-radius: 6px; }
@@ -51,6 +54,13 @@ QProgressBar::chunk { background: #59ba9d; border-radius: 4px; }
 QScrollArea { border: none; background: transparent; }
 QScrollBar:horizontal { height: 10px; background: #172231; }
 QScrollBar::handle:horizontal { background: #42566f; min-width: 25px; border-radius: 4px; }
+QScrollBar:vertical { width: 10px; background: #172231; }
+QScrollBar::handle:vertical { background: #42566f; min-height: 25px; border-radius: 4px; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; background: transparent; }
+QTabWidget::pane { border: 1px solid #283548; background: #171f2b; border-radius: 6px; }
+QTabBar::tab { background: #202b3a; padding: 7px 12px; }
+QTabBar::tab:selected { background: #31534f; color: #b8ffe7; }
+QWidget#layerProperties { background: #171f2b; }
 QSplitter::handle { background: #263246; }
 QToolTip { background: #25374b; color: #e6f2ff; border: 1px solid #52708e; }
 '''
@@ -108,7 +118,7 @@ class PreviewDialog(QDialog):
         event.accept()
 
 
-class MainWindow(QMainWindow):
+class MainWindow(QMainWindow, LayerEditing):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Q-Pixelate · 长视频局部打码')
@@ -126,6 +136,11 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._pause_on_frame = False
         self._editing_row = -1
+        self._drafts = {}
+        self._layer_id = None
+        self._layer_target = 'sticker'
+        self._transform_before = None
+        self._mask_context = None
         self._loading_form = False
         self._range_locked = False
         self.mask_points = []
@@ -169,7 +184,7 @@ class MainWindow(QMainWindow):
         preview_panel = QFrame()
         preview_panel.setObjectName('panel')
         preview_layout = QVBoxLayout(preview_panel)
-        self.mode_label = label('原画编辑 · 遮挡框表示位置；点击“预览效果”查看实际模糊。')
+        self.mode_label = label('将素材库贴纸拖到画面。遮罩轮廓可在画面编辑，实际模糊和羽化可通过效果预览检查。')
         self.mode_label.setWordWrap(True)
         preview_layout.addWidget(self.mode_label)
         self.canvas = VideoCanvas()
@@ -218,7 +233,7 @@ class MainWindow(QMainWindow):
         self.clip_list.currentRowChanged.connect(self.select_edit)
         side_layout.addWidget(self.clip_list, 1)
         row = QHBoxLayout()
-        row.addWidget(button('＋ 添加选区', self.add_edit, True))
+        row.addWidget(button('＋ 添加选区', self.add_selection, True))
         remove = button('删除片段', self.delete_edit)
         remove.setObjectName('danger')
         row.addWidget(remove)
@@ -233,6 +248,7 @@ class MainWindow(QMainWindow):
         self.workflow_label.setWordWrap(True)
         side_layout.addWidget(self.workflow_label)
         form = QFormLayout()
+        self.clip_form = form
         form.setSpacing(9)
         self.in_time = TimeSpinBox()
         self.out_time = TimeSpinBox()
@@ -283,12 +299,25 @@ class MainWindow(QMainWindow):
             region_layout.addRow(name, spin)
         side_layout.addWidget(self.region_panel)
         self.image_button = button('导入贴纸到素材库…', self.choose_image)
+        self.sticker_library_list = StickerList()
+        library = QWidget()
+        library_layout = QVBoxLayout(library)
+        library_layout.addWidget(self.image_button)
+        library_layout.addWidget(label('从这里拖到视频画面。'))
+        library_layout.addWidget(self.sticker_library_list, 1)
+        self.layer_panel = LayerInspector()
+        self.layer_tab = QWidget()
+        self.layer_tab.setObjectName('layerProperties')
+        layer_layout = QVBoxLayout(self.layer_tab)
+        layer_layout.addWidget(self.layer_panel)
+        self.layer_empty = label('先在选区轨创建或选中一个选区。')
+        layer_layout.addWidget(self.layer_empty)
+        layer_layout.addStretch()
         self.sticker_combo = QComboBox()
         self.sticker_combo.currentIndexChanged.connect(self.sticker_selected)
         side_layout.addWidget(self.sticker_combo)
         self.image_label = label('尚未选择贴纸')
         self.image_label.setWordWrap(True)
-        side_layout.addWidget(self.image_button)
         side_layout.addWidget(self.image_label)
         actions_panel = QWidget()
         actions_layout = QVBoxLayout(actions_panel)
@@ -300,23 +329,28 @@ class MainWindow(QMainWindow):
         row.addWidget(self.unlock_button)
         actions_layout.addLayout(row)
         actions_layout.addWidget(button('预览当前片段效果', self.preview_edit))
-        note = label('确认后退出修改并锁定该片段。再次修改需先解锁。\n区域模糊支持直接绘制；点击“重新绘制”可替换遮罩。')
-        note.setWordWrap(True)
-        side_layout.addWidget(note)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(side)
+        layer_properties = QScrollArea()
+        layer_properties.setWidgetResizable(True)
+        layer_properties.setWidget(self.layer_tab)
+        self.editor_tabs = QTabWidget()
+        self.editor_tabs.addTab(scroll, '选区')
+        self.editor_tabs.addTab(library, '贴纸素材')
+        self.editor_tabs.addTab(layer_properties, '图层属性')
+        self.editor_tabs.setCurrentWidget(library)
         editor_panel = QWidget()
         editor_panel.setMinimumWidth(375)
         editor_layout = QVBoxLayout(editor_panel)
         editor_layout.setContentsMargins(0, 0, 0, 0)
-        editor_layout.addWidget(scroll, 1)
+        editor_layout.addWidget(self.editor_tabs, 1)
         editor_layout.addWidget(actions_panel)
         splitter.addWidget(editor_panel)
         splitter.setSizes([950, 380])
         timeline_header = QHBoxLayout()
         timeline_header.addWidget(label('源视频时间轴', 'section'))
-        timeline_header.addWidget(label('  I / O 选区 · Shift 拖动下轨 · 空格仅播放 · 中键平移'))
+        timeline_header.addWidget(label('  I / O 设入出点 · 空格播放 / 暂停'))
         timeline_header.addStretch()
         self.in_button = button('设为入点 I', self.set_in)
         self.out_button = button('设为出点 O', self.set_out)
@@ -330,6 +364,13 @@ class MainWindow(QMainWindow):
         body.addLayout(timeline_header)
         self.timeline = Timeline()
         body.addWidget(self.timeline)
+        layer_scroll = QScrollArea()
+        layer_scroll.setWidgetResizable(True)
+        layer_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layer_scroll.setFixedHeight(76)
+        self.layer_timeline = LayerTimeline(self.timeline)
+        layer_scroll.setWidget(self.layer_timeline)
+        body.addWidget(layer_scroll)
         self.scrollbar = QScrollBar(Qt.Orientation.Horizontal)
         self.scrollbar.setRange(0, 10000)
         self.scrollbar.setPageStep(10000)
@@ -339,6 +380,9 @@ class MainWindow(QMainWindow):
         self.scrollbar.valueChanged.connect(self.scroll_timeline)
         self.timeline.selectionChanged.connect(self.set_selection)
         self.timeline.seekRequested.connect(self.seek)
+        self.timeline.editActivated.connect(self.activate_from_timeline)
+        self.timeline.editDragged.connect(self.drag_selection)
+        self.timeline.rangeCreated.connect(self.create_ranges)
         layout.addWidget(self.body, 1)
         footer = QHBoxLayout()
         self.status = label('就绪 · 首版快速导出优先支持 H.264 / SDR / 固定帧率录屏')
@@ -373,6 +417,7 @@ class MainWindow(QMainWindow):
         self.player.errorOccurred.connect(lambda err, text: self.status.setText(f'播放提示：{text}'))
         self.canvas.rectChanged.connect(self.canvas_rect_changed)
         self.canvas.pointsChanged.connect(self.canvas_points_changed)
+        self.connect_layer_editor()
         QApplication.instance().installEventFilter(self)
         self.refresh_stickers()
         self.effect_changed()
@@ -455,6 +500,7 @@ class MainWindow(QMainWindow):
         project.validate(info.duration)
         self._loading_form = True
         self._editing_row = -1
+        self._drafts.clear()
         self._range_locked = False
         self.project, self.info = project, info
         self.project_path = None
@@ -469,6 +515,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_dimensions(info.width*pixel_aspect, info.height)
         self.player.setSource(QUrl.fromLocalFile(project.source))
         self.timeline.set_duration(info.duration)
+        self.timeline.minimum_span = 1/info.fps_float
         self.timeline.position = 0
         self.zoom.setValue(1)
         self.sync_scrollbar(0)
@@ -482,7 +529,7 @@ class MainWindow(QMainWindow):
         self.dirty = False
         self.mark_title()
         error = info.fast_mode_error()
-        self.status.setText(error or '视频已打开 · 选择时间范围，再添加修订片段')
+        self.status.setText(error or '视频已打开 · 在选区轨上右键拖动创建选区')
         self.position_changed(0)
         self.seek(0)
         self.update_edit_controls()
@@ -494,7 +541,10 @@ class MainWindow(QMainWindow):
             return
         def load(runner):
             project = Project.load(path)
-            return project, probe(project.source, runner)
+            info = probe(project.source, runner)
+            for edit in project.edits:
+                edit.promote_layers(info.width, info.height)
+            return project, info
         def done(result):
             self.set_project(*result)
             self.project_path = path
@@ -513,8 +563,7 @@ class MainWindow(QMainWindow):
         try:
             if not Path(path).suffix:
                 path += '.qpixel'
-            protected = [Path(self.project.source).resolve()] + [Path(e.image).resolve() for e in self.project.edits if e.image]
-            if Path(path).resolve() in protected:
+            if Path(path).resolve() in self.project.asset_paths():
                 raise ValueError('工程文件不能覆盖源视频或图片素材。')
             self.project.save(path)
             self.project_path = path
@@ -535,9 +584,21 @@ class MainWindow(QMainWindow):
 
     def form_changed(self, *args):
         row = self._editing_row
-        if (not self._loading_form and not self._syncing and self.project and
-                0 <= row < len(self.project.edits) and not self.project.edits[row].locked and self.current_edit() != self.project.edits[row]):
+        if (self._loading_form or self._syncing or not self.project
+                or not 0 <= row < len(self.project.edits) or self.project.edits[row].locked):
+            return
+        current = self.current_edit()
+        stored = self.project.edits[row]
+        if current != stored:
             self.changed()
+        if current.layers is not None:
+            self.stash_edit()
+            edit = self._drafts.get(row, stored)
+            self.timeline.edits[row] = edit
+            self.clip_list.item(row).setText(self.edit_caption(row, edit))
+            self.layer_timeline.update()
+            self.sync_layer_editor()
+            self.update_canvas_mask()
 
     def set_selection(self, start, end):
         if self._range_locked and not self._loading_form:
@@ -555,16 +616,90 @@ class MainWindow(QMainWindow):
             self.in_time.setValue(self.timeline.selection[0])
             self.out_time.setValue(self.timeline.selection[1])
             return
-        self.timeline.selection = self.in_time.value(), self.out_time.value()
+        start, end = self.in_time.value(), self.out_time.value()
+        if self.layer_edit() is not None:
+            if (end-start < self.timeline.minimum_span-.0005 or any(
+                    index != self._editing_row and start < edit.end-1e-8 and end > edit.start+1e-8
+                    for index, edit in enumerate(self.timeline.edits))):
+                with QSignalBlocker(self.in_time), QSignalBlocker(self.out_time):
+                    self.in_time.setValue(self.timeline.selection[0])
+                    self.out_time.setValue(self.timeline.selection[1])
+                self.status.setText('选区至少需要一帧，且不能与其他选区重叠。')
+                return
+        self.timeline.selection = start, end
         self.timeline.update()
         self.form_changed()
 
     def current_edit(self):
-        locked = bool(self.project and 0 <= self._editing_row < len(self.project.edits) and self.project.edits[self._editing_row].locked)
+        row = self._editing_row
+        base = self._drafts.get(row, self.project.edits[row]) if self.project and 0 <= row < len(self.project.edits) else None
+        locked = bool(base and base.locked)
+        if base and base.layers is not None:
+            start, end = self.timeline.selection
+            delta = base.start-start
+            layers = [replace(layer, start=layer.start+delta, end=layer.end+delta) for layer in base.layers] if delta else base.layers
+            return replace(base, start=start, end=end, speed=self.speed.value(), range_locked=self._range_locked, layers=layers)
         return Edit(self.in_time.value(), self.out_time.value(), ['blur', 'region', 'image', 'none'][self.effect.currentIndex()],
                     Rect(*(s.value()/100 for s in self.coordinates)), self.strength.value(), self.image_path,
                     self.speed.value(), ['rect', 'ellipse', 'lasso'][self.shape.currentIndex()],
                     list(self.mask_points), self.feather.value(), self._range_locked, locked)
+
+    def stash_edit(self):
+        row = self._editing_row
+        if row >= 0 and not self.selected_locked():
+            edit = self.current_edit()
+            if edit != self.project.edits[row]:
+                self._drafts[row] = edit
+            else:
+                self._drafts.pop(row, None)
+            self.timeline.edits[row] = self._drafts.get(row, self.project.edits[row])
+            self.clip_list.item(row).setText(self.edit_caption(row, self.timeline.edits[row]))
+
+    def activate_from_timeline(self, row):
+        if row != self._editing_row:
+            with QSignalBlocker(self.clip_list):
+                self.clip_list.setCurrentRow(row)
+            self.select_edit(row, keep_draft=True)
+
+    def create_ranges(self, start, end):
+        if not self.project or start >= end:
+            return
+        self.stash_edit()
+        cursor, gaps = start, []
+        for edit in sorted(self.timeline.edits, key=lambda edit: edit.start):
+            if edit.end <= cursor:
+                continue
+            if edit.start >= end:
+                break
+            if cursor < edit.start:
+                gaps.append((cursor, edit.start))
+            cursor = max(cursor, edit.end)
+        if cursor < end:
+            gaps.append((cursor, end))
+        minimum = self.timeline.minimum_span
+        new = [Edit(a, b, 'none', layers=[]) for a, b in gaps if b-a >= minimum-1e-8]
+        if not new:
+            self.status.setText('拖动范围内没有至少一帧的空白时间。')
+            return
+        first = len(self.project.edits)
+        self.project.edits.extend(new)
+        self.refresh_edits(first)
+        self.changed()
+
+    def add_selection(self):
+        self.create_ranges(*self.timeline.selection)
+
+    def drag_selection(self, row, start, end, mode):
+        if row != self._editing_row or self.selected_locked() or self._range_locked:
+            return
+        edit = self.current_edit()
+        if edit.layers is not None and mode == 'left':
+            delta = edit.start-start
+            edit = replace(edit, layers=[replace(layer, start=layer.start+delta, end=layer.end+delta)
+                                         for layer in edit.layers])
+        self._drafts[row] = replace(edit, start=start, end=end)
+        self.refresh_edits(row)
+        self.changed()
 
     def add_edit(self):
         if not self.project:
@@ -596,23 +731,25 @@ class MainWindow(QMainWindow):
         edit = self.current_edit()
         edit.locked = True
         edit.range_locked = True
-        candidate = copy.deepcopy(self.project)
-        candidate.edits[row] = edit
         try:
-            candidate.validate(self.info.duration)
+            edit.validate(self.info.duration)
+            if any(index != row and edit.start < other.end-1e-8 and edit.end > other.start+1e-8
+                   for index, other in enumerate(self.timeline.edits)):
+                raise ValueError('修订片段重叠，请调整入点和出点。')
         except ValueError as exc:
             self.error(str(exc))
             return False
         self.project.edits[row] = edit
+        self._drafts.pop(row, None)
         self.refresh_edits(row)
         self.changed()
         self.status.setText('修改已确认，已退出编辑并锁定片段。')
         return True
 
     def commit_form(self):
-        row = self.clip_list.currentRow()
-        if self.project and row >= 0 and not self.project.edits[row].locked and self.current_edit() != self.project.edits[row]:
-            self.status.setText('当前片段有未确认的修改，请先点击“确认并锁定片段”。')
+        self.stash_edit()
+        if self._drafts:
+            self.status.setText('有未确认的片段，请先选择带 * 的片段并确认。')
             return False
         return True
 
@@ -620,32 +757,47 @@ class MainWindow(QMainWindow):
         self._editing_row = -1
         blocker = QSignalBlocker(self.clip_list)
         self.clip_list.clear()
-        names = {'blur': '全屏模糊', 'region': '区域模糊', 'image': '贴纸遮挡', 'none': '仅变速'}
-        for i, edit in enumerate(self.project.edits):
-            self.clip_list.addItem(f'{i+1:02}  {time_text(edit.start)} → {time_text(edit.end)}\n      {names[edit.effect]} · {edit.speed:g}× · {"已锁定" if edit.locked else "编辑中"}')
+        edits = [self._drafts.get(i, edit) for i, edit in enumerate(self.project.edits)]
+        for i, edit in enumerate(edits):
+            self.clip_list.addItem(self.edit_caption(i, edit))
         self.clip_list.setCurrentRow(selected)
         self.count_label.setText(f'{len(self.project.edits)} 段')
-        self.timeline.edits = self.project.edits
+        self.timeline.edits = edits
+        self.timeline.active_row = selected
         self.timeline.update()
         del blocker
         if selected >= 0:
             self.select_edit(selected)
 
-    def select_edit(self, row):
+    def edit_caption(self, row, edit):
+        names = {'blur': '全屏模糊', 'region': '区域模糊', 'image': '贴纸遮挡', 'none': '仅变速'}
+        summary = names[edit.effect] if edit.layers is None else f'{len(edit.layers)} 个图层'
+        pending = ' *' if row in self._drafts else ''
+        return (f'{row+1:02}{pending}  {time_text(edit.start)} → {time_text(edit.end)}\n'
+                f'      {summary} · {edit.speed:g}× · {"已锁定" if edit.locked else "编辑中"}')
+
+    def select_edit(self, row, keep_draft=False):
         if not self.project or row < 0 or row >= len(self.project.edits):
             return
         previous = self._editing_row
         if 0 <= previous < len(self.project.edits) and previous != row and not self._loading_form:
             pending = self.current_edit()
-            if not self.project.edits[previous].locked and pending != self.project.edits[previous]:
+            if keep_draft or pending.layers is not None:
+                self.stash_edit()
+            elif not self.project.edits[previous].locked and pending != self.project.edits[previous]:
                 blocker = QSignalBlocker(self.clip_list)
                 self.clip_list.setCurrentRow(previous)
                 self.status.setText('请先确认当前片段，再切换片段。')
                 return
-        edit = self.project.edits[row]
+        edit = self._drafts.get(row, self.project.edits[row])
         was_loading = self._loading_form
         self._loading_form = True
+        if previous != row or edit.locked:
+            self.cancel_layer_interaction()
+            self._layer_id = edit.layers[0].id if edit.layers else None
+            self._layer_target = 'mask' if edit.layers and edit.layers[0].kind == 'blur' else 'sticker'
         self._editing_row = row
+        self.timeline.active_row = row
         self._range_locked = edit.range_locked
         self.set_selection(edit.start, edit.end)
         self.effect.setCurrentIndex(['blur', 'region', 'image', 'none'].index(edit.effect))
@@ -659,14 +811,13 @@ class MainWindow(QMainWindow):
         self.canvas_rect_changed(edit.rect)
         self.canvas.draw_new = False
         self._loading_form = was_loading
-        self.update_canvas_mask()
         self.update_edit_controls()
-        self.seek(edit.start)
 
     def delete_edit(self):
         row = self.clip_list.currentRow()
         if self.project and row >= 0 and not self.project.edits[row].locked:
             del self.project.edits[row]
+            self._drafts = {i-(i > row): edit for i, edit in self._drafts.items() if i != row}
             self.refresh_edits(min(row, len(self.project.edits)-1))
             if not self.project.edits:
                 self._range_locked = False
@@ -676,7 +827,6 @@ class MainWindow(QMainWindow):
     def effect_changed(self, index=None):
         index = self.effect.currentIndex()
         self.region_panel.setVisible(index in (1, 2))
-        self.image_button.setVisible(index == 2)
         self.image_label.setVisible(index == 2)
         self.sticker_combo.setVisible(index == 2)
         self.shape.setEnabled(index == 1)
@@ -761,29 +911,37 @@ class MainWindow(QMainWindow):
 
     def update_edit_controls(self):
         locked = self.selected_locked()
+        layered = self.layer_edit() is not None
+        legacy = self._editing_row >= 0 and not layered
         self.timeline.selection_locked = self._range_locked or locked
         for widget in (self.in_time, self.out_time, self.in_button, self.out_button):
             widget.setEnabled(not self.timeline.selection_locked)
         self.range_button.setEnabled(not locked)
         self.range_button.setText('解锁片段长度' if self._range_locked else '锁定片段长度')
-        self.confirm_button.setEnabled(not locked and self._editing_row >= 0 and self._range_locked)
+        self.confirm_button.setEnabled(not locked and self._editing_row >= 0 and (layered or self._range_locked))
         self.unlock_button.setEnabled(locked)
         editable = not locked and self._range_locked
         index = self.effect.currentIndex()
+        for widget in (self.effect, self.strength, self.shape, self.feather, self.redraw_button):
+            self.clip_form.setRowVisible(widget, legacy)
         self.effect.setEnabled(editable)
-        self.speed.setEnabled(editable)
+        self.speed.setEnabled(not locked and (layered or editable))
         self.strength.setEnabled(editable and index in (0, 1))
         self.shape.setEnabled(editable and index == 1)
         self.feather.setEnabled(editable and index == 1)
         self.redraw_button.setEnabled(editable and index in (1, 2))
         self.region_panel.setEnabled(editable)
-        self.region_panel.setVisible(index in (1, 2) and not (index == 1 and self.shape.currentIndex() == 2))
-        self.image_button.setEnabled(editable)
+        self.region_panel.setVisible(legacy and index in (1, 2) and not (index == 1 and self.shape.currentIndex() == 2))
+        self.image_button.setEnabled(True)
+        self.sticker_combo.setVisible(legacy and index == 2)
+        self.image_label.setVisible(legacy and index == 2)
         self.sticker_combo.setEnabled(editable)
         self.workflow_label.setText('片段已确认并锁定 · 需要修改时先解锁' if locked else
+                                    '编辑图层后可确认并锁定' if layered else
                                     '长度已锁定 → 修改 → 确认并锁定片段' if self._range_locked else
-                                    '选定片段 → 锁定长度 → 修改 → 确认退出')
+                                    '在选区轨右键拖动，或输入入点和出点后添加选区')
         self.timeline.update()
+        self.sync_layer_editor()
         self.update_canvas_mask()
 
     def toggle_range_lock(self):
@@ -799,15 +957,19 @@ class MainWindow(QMainWindow):
     def unlock_edit(self):
         if self.selected_locked():
             self.project.edits[self._editing_row].locked = False
+            if self.project.edits[self._editing_row].layers is not None:
+                self.project.edits[self._editing_row].range_locked = False
             self.refresh_edits(self._editing_row)
             self.changed()
 
     def new_selection(self):
-        if not self.commit_form():
-            return
+        self.stash_edit()
         blocker = QSignalBlocker(self.clip_list)
         self.clip_list.setCurrentRow(-1)
         self._editing_row = -1
+        self.cancel_layer_interaction()
+        self._layer_id = None
+        self.timeline.active_row = -1
         self._range_locked = False
         self._loading_form = True
         self.effect.setCurrentIndex(0)
@@ -837,10 +999,14 @@ class MainWindow(QMainWindow):
         blocker = QSignalBlocker(self.sticker_combo)
         self.sticker_combo.clear()
         self.sticker_combo.addItem('选择素材库贴纸…', '')
+        self.sticker_library_list.clear()
         for path in self.sticker_library.items():
-            self.sticker_combo.addItem(QIcon(path), Path(path).stem.rsplit('-', 1)[0], path)
+            name = Path(path).stem.rsplit('-', 1)[0]
+            self.sticker_combo.addItem(QIcon(path), name, path)
+            self.sticker_library_list.add_asset(path, name)
         if selected:
             self.sticker_combo.setCurrentIndex(self.sticker_combo.findData(selected))
+            self.sticker_library_list.setCurrentItem(self.sticker_library_list.find_asset(selected))
         del blocker
         if selected:
             self.sticker_selected()
@@ -892,6 +1058,7 @@ class MainWindow(QMainWindow):
             self.timeline.view_start = max(0, min(self.info.duration-self.timeline.visible, seconds-self.timeline.visible*.1))
             self.sync_scrollbar(self.timeline.view_start)
         self.timeline.update()
+        self.layer_timeline.update()
         self.update_canvas_mask(seconds)
 
     def playback_state_changed(self, state):
@@ -901,10 +1068,31 @@ class MainWindow(QMainWindow):
     def update_canvas_mask(self, seconds=None):
         # Playback follows the active saved edit; paused editing follows the form.
         playing = hasattr(self, 'player') and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState and not self._pause_on_frame
+        seconds = self.timeline.position if seconds is None else seconds
+        selected = self.layer_edit()
+        active_row = next((i for i, edit in enumerate(self.timeline.edits) if edit.start <= seconds < edit.end), -1)
+        active = self.timeline.edits[active_row] if self.project and active_row >= 0 else None
+        self._canvas_layer_row = active_row
+        self.canvas.layers = []
+        self.canvas.layer_target = None
+        if active and active.layers is not None:
+            self.canvas.layers = [(i, layer) for i, layer in enumerate(active.layers)
+                                  if (span := active.layer_span(layer))[0] <= seconds < span[1]]
+        if selected:
+            if not playing and not selected.locked:
+                layer = self.selected_layer(selected)
+                transform = self.target_transform(layer)
+                if transform:
+                    mask = layer.mask if self._layer_target == 'mask' else None
+                    self.canvas.layer_target = transform, mask
+            self.canvas.show_mask = False
+            self.canvas.editable = False
+            self.canvas.update()
+            return
         if playing and self.project:
             seconds = self.player.position()/1000 if seconds is None else seconds
             edit = next((e for e in self.project.edits if e.start <= seconds < e.end), None)
-            self.canvas.show_mask = edit is not None and edit.effect != 'none'
+            self.canvas.show_mask = edit is not None and edit.layers is None and edit.effect != 'none'
             self.canvas.editable = False
             if edit:
                 self.canvas.rect = copy.copy(edit.rect)
@@ -919,7 +1107,7 @@ class MainWindow(QMainWindow):
             self.canvas.shape = ['rect', 'ellipse', 'lasso'][self.shape.currentIndex()] if index == 1 else 'rect'
             self.canvas.points = list(self.mask_points)
             self.canvas.fullscreen_mask = index == 0
-            self.canvas.show_mask = self.project is not None and index != 3
+            self.canvas.show_mask = self.project is not None and self._editing_row >= 0 and index != 3
             self.canvas.effect_label = '原画编辑 · 全屏模糊区域' if index == 0 else '原画编辑 · 拖动画框 / 内部移动 / 右下角缩放'
         self.canvas.update()
 
@@ -931,17 +1119,19 @@ class MainWindow(QMainWindow):
         maximum = max(.001, available)
         self.scrollbar.setValue(round(start/maximum*10000))
         self.scrollbar.setPageStep(max(1, round(10000/max(.001, self.timeline.zoom-1))))
+        self.layer_timeline.update()
 
     def scroll_timeline(self, value):
         self.timeline.view_start = value/10000*max(0, self.timeline.duration-self.timeline.visible)
         self.timeline.update()
+        self.layer_timeline.update()
 
     def preview_edit(self):
         row = self.clip_list.currentRow()
         if not self.project or row < 0:
             self.status.setText('请先添加并选择一个修订片段。')
             return
-        project = copy.deepcopy(self.project)
+        project = copy.deepcopy(Project(self.project.source, self.timeline.edits, self.project.fingerprint))
         if not project.edits[row].locked:
             project.edits[row] = self.current_edit()
         try:
@@ -1004,6 +1194,22 @@ class MainWindow(QMainWindow):
                 self.stop_shuttle()
             return True
         focus = QApplication.focusWidget()
+        if event.type() == QEvent.Type.KeyPress:
+            if key == Qt.Key_T and event.modifiers() == Qt.ControlModifier and self.begin_transform():
+                return True
+            if focus is self.canvas and key == Qt.Key_Escape and self.canvas.mask_shape is not None:
+                self.cancel_layer_interaction()
+                self.update_canvas_mask()
+                self.status.setText('已取消绘制遮罩。')
+                return True
+            if self.canvas.free_transform and key in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter):
+                geometry_focus = next((spin for spin in self.layer_panel.geometry
+                                       if spin is focus or (focus and spin.isAncestorOf(focus))), None)
+                if focus is self.canvas or geometry_focus:
+                    if geometry_focus and key != Qt.Key_Escape:
+                        geometry_focus.interpretText()
+                    self.finish_transform(key == Qt.Key_Escape)
+                    return True
         if isinstance(focus, (QLineEdit, QAbstractSpinBox, QTextEdit, QComboBox)):
             return False
         if key not in (Qt.Key_Space, Qt.Key_Left, Qt.Key_Right, Qt.Key_I, Qt.Key_O, Qt.Key_Delete):
@@ -1028,7 +1234,12 @@ class MainWindow(QMainWindow):
             elif key == Qt.Key_O:
                 self.set_out()
             elif key == Qt.Key_Delete:
-                self.delete_edit()
+                in_layers = focus in (self.canvas, self.layer_timeline) or (
+                    focus is not None and self.layer_panel.isAncestorOf(focus))
+                if in_layers and self.layer_edit() is not None:
+                    self.delete_layer()
+                elif focus in (self.clip_list, self.timeline):
+                    self.delete_edit()
         return True
 
     def dragEnterEvent(self, event):

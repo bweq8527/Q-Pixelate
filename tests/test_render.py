@@ -4,13 +4,65 @@ import unittest
 from pathlib import Path
 
 from media_helpers import command, fixture, hashes, image_at
-from q_pixelate.model import Edit, Project, Rect
+from q_pixelate.model import Edit, Layer, Mask, Project, Rect, Transform
 from q_pixelate.process import Cancelled, Runner
 from q_pixelate.media import probe, index_video
 from q_pixelate.render import Exporter, render_preview
 
 
 class RenderTests(unittest.TestCase):
+    def test_layers_composite_by_time_and_sticker_mask_stays_in_video_coordinates(self):
+        from PIL import Image
+        sticker = self.root.resolve()/'green.png'
+        top = self.root.resolve()/'magenta.png'
+        Image.new('RGBA', (20, 20), (0, 255, 0, 255)).save(sticker)
+        Image.new('RGBA', (20, 20), (255, 0, 255, 255)).save(top)
+        mask = Mask('ellipse', Transform(.5, .5, .28, .45), feather=3)
+        layers = [
+            Layer(.25, 1.5, 'sticker', image=str(sticker), transform=Transform(.4, .5, .65, .6, 20), mask=mask),
+            Layer(.75, 1, 'sticker', image=str(top), transform=Transform(.5, .5, .12, .12)),
+        ]
+        edit = Edit(2, 5, 'none', layers=layers)
+        path = self.root/'layers.qpixel'
+        Project(str(self.source), [edit]).save(path)
+        project = Project.load(path)
+        self.assertEqual(project.edits, [edit])
+        out, report = self.export(project.edits, 'layers.mp4')
+        preview = self.root/'layers-preview.mp4'
+        render_preview(project, 0, preview, Runner())
+        self.assertEqual(report.encoded_seconds, 2)
+        for video, offset in ((out, 40), (preview, 0)):
+            base, green, magenta, after = [image_at(video, offset+i) for i in (2, 10, 17, 34)]
+            self.assertGreater(green.getpixel((160, 90))[1], 220)
+            self.assertGreater(magenta.getpixel((160, 90))[0], 220)
+            self.assertGreater(magenta.getpixel((160, 90))[2], 220)
+            for image, frame in ((base, 42), (after, 74)):
+                original = image_at(self.source, frame)
+                self.assertLess(sum(abs(a-b) for a, b in zip(image.getpixel((160, 90)), original.getpixel((160, 90)))), 35)
+            outside = image_at(self.source, 50).getpixel((95, 90))
+            self.assertLess(sum(abs(a-b) for a, b in zip(green.getpixel((95, 90)), outside)), 35)
+
+        # Shift only the image. Its old overlap with the stationary mask disappears.
+        layers[0].transform.x = .05
+        layers[0].transform.w = .2
+        moved, _ = self.export([edit], 'moved.mp4')
+        self.assertLess(sum(abs(a-b) for a, b in zip(image_at(moved, 50).getpixel((160, 90)),
+                                                    image_at(self.source, 50).getpixel((160, 90)))), 35)
+
+    def test_migrating_old_sticker_keeps_even_pixel_coverage(self):
+        from PIL import Image
+        asset = self.root/'legacy-sticker.png'
+        Image.new('RGBA', (24, 24), (0, 255, 0, 255)).save(asset)
+        path = self.root/'legacy.qpixel'
+        edit = Edit(2, 3, 'image', Rect(83.9/320, .25, .4, .5), image=str(asset))
+        Project(str(self.source), [edit]).save(path)
+        project = Project.load(path)
+        project.edits[0].promote_layers(320, 180)
+        output = self.root/'legacy-migrated.mp4'
+        render_preview(project, 0, output, Runner())
+        red, green, blue = image_at(output, 1).getpixel((82, 90))
+        self.assertGreater(green-max(red, blue), 180)
+
     def test_speed_preserves_delayed_audio_on_source_timeline(self):
         import array
         source = self.root/'delayed.mp4'

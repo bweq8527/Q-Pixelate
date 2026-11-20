@@ -3,15 +3,18 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import tempfile
 import unittest
 from pathlib import Path
-from PySide6.QtCore import Qt, QPoint
+from PySide6.QtCore import Qt, QPoint, QPointF, QMimeData
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from media_helpers import fixture
 from q_pixelate.app import MainWindow
-from q_pixelate.model import Project, Edit
+from q_pixelate.model import Project, Edit, Layer
+from q_pixelate.masks import transform_geometry
 from q_pixelate.media import probe
 from q_pixelate.process import Runner
 from q_pixelate.widgets import Timeline, VideoCanvas
+from q_pixelate.stickers import STICKER_MIME, StickerLibrary
 
 
 class EditorUpgradeTests(unittest.TestCase):
@@ -90,10 +93,123 @@ class EditorUpgradeTests(unittest.TestCase):
         QTest.mouseClick(t, Qt.LeftButton, Qt.NoModifier, QPoint(pos.x(), 40))
         self.assertTrue(seeks)
         self.assertEqual(t.selection, (20, 40))
+        seeks.clear()
+        QTest.mouseClick(t, Qt.LeftButton, Qt.NoModifier, t.point_for_time(30))
+        QTest.mouseClick(t, Qt.LeftButton, Qt.NoModifier, t.point_for_time(60))
         t.selection_locked = True
         QTest.mousePress(t, Qt.LeftButton, Qt.ShiftModifier, t.point_for_time(50))
         QTest.mouseRelease(t, Qt.LeftButton, Qt.ShiftModifier, t.point_for_time(70))
         self.assertEqual(t.selection, (20, 40))
+        self.assertEqual(seeks, [])
+
+    def test_right_drag_splits_around_existing_selections_without_seeking(self):
+        w = self.window([Edit(2, 3, locked=True)])
+        w.player.pause()
+        w.timeline.resize(640, 120)
+        seeks = []
+        w.timeline.seekRequested.connect(seeks.append)
+        QTest.mousePress(w.timeline, Qt.RightButton, Qt.NoModifier, w.timeline.point_for_time(4))
+        QTest.mouseRelease(w.timeline, Qt.RightButton, Qt.NoModifier, w.timeline.point_for_time(1))
+        self.assertEqual(sorted((e.start, e.end) for e in w.project.edits), [(1, 2), (2, 3), (3, 4)])
+        self.assertEqual(seeks, [])
+
+    def test_drop_creates_multiple_layers_and_mask_edits_do_not_move_sticker(self):
+        w = self.window([Edit(1, 5, 'none', layers=[])])
+        w.show()
+        self.app.processEvents()
+        w.player.pause()
+        w.position_changed(2000)
+        w.sticker_library = StickerLibrary(Path(self.temp.name)/'drop-library')
+        path = Path(self.temp.name)/'drop.png'
+        image = QImage(40, 20, QImage.Format.Format_ARGB32)
+        image.fill(Qt.GlobalColor.green)
+        self.assertTrue(image.save(str(path)))
+        asset = w.sticker_library.add(path)
+        w.refresh_stickers(asset)
+        mime = QMimeData()
+        mime.setData(STICKER_MIME, asset.encode('utf-8'))
+        box = w.canvas.video_rect()
+        for x, milliseconds in ((.3, 2000), (.6, 2000), (.75, 4990)):
+            w.position_changed(milliseconds)
+            point = QPointF(box.x()+box.width()*x, box.center().y())
+            front = QDragEnterEvent(point.toPoint(), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+            QApplication.sendEvent(w.canvas, front)
+            drop = QDropEvent(point, Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+            QApplication.sendEvent(w.canvas, drop)
+            self.assertTrue(drop.isAccepted())
+        layers = w.current_edit().layers
+        self.assertEqual([(item.start, item.end) for item in layers[:2]], [(1, 3), (1, 3)])
+        self.assertEqual(len(layers), 3)
+        self.assertAlmostEqual(layers[2].start, 3.95)
+        self.assertEqual(layers[2].end, 4)
+        self.assertAlmostEqual(layers[1].transform.x, .6)
+        w.position_changed(2000)
+        w.editor_tabs.setCurrentIndex(2)
+        w.layer_panel.picker.setCurrentIndex(1)
+        QTest.mouseClick(w.layer_panel.redraw, Qt.LeftButton)
+        a, b = (QPoint(round(box.x()+box.width()*x), round(box.y()+box.height()*x)) for x in (.4, .7))
+        QTest.mousePress(w.canvas, Qt.LeftButton, Qt.NoModifier, a)
+        QTest.mouseRelease(w.canvas, Qt.LeftButton, Qt.NoModifier, b)
+        layer = w.current_edit().layers[1]
+        self.assertEqual(layer.transform, layers[1].transform)
+        self.assertIsNotNone(layer.mask)
+        w.layer_panel.geometry[0].setValue(44)
+        changed = w.current_edit().layers[1]
+        self.assertEqual(changed.mask.transform.x, .44)
+        self.assertEqual(changed.transform, layer.transform)
+        w.layer_panel.target.setCurrentIndex(0)
+        w.canvas.setFocus()
+        QTest.keyClick(w.canvas, Qt.Key_T, Qt.ControlModifier)
+        matrix, local = transform_geometry(changed.transform, w.canvas.video_rect())
+        knob = matrix.map(QPointF(0, local.top()-22)).toPoint()
+        rotated = matrix.map(QPointF(-local.top()+22, 0)).toPoint()
+        QTest.mousePress(w.canvas, Qt.LeftButton, Qt.NoModifier, knob)
+        QTest.mouseRelease(w.canvas, Qt.LeftButton, Qt.NoModifier, rotated)
+        self.assertAlmostEqual(w.current_edit().layers[1].transform.angle, 90, delta=2)
+        geometry_field = w.layer_panel.geometry[0]
+        geometry_field.setFocus()
+        QTest.keyClick(geometry_field.lineEdit(), Qt.Key_Escape)
+        self.assertEqual(w.current_edit().layers[1].transform, changed.transform)
+        self.assertEqual(w.current_edit().layers[1].mask, changed.mask)
+        QTest.mouseClick(w.layer_timeline, Qt.LeftButton, Qt.NoModifier, QPoint(50, 32))
+        QTest.keyClick(w.layer_timeline, Qt.Key_Delete)
+        self.assertEqual(len(w.project.edits), 1)
+        self.assertEqual([layer.id for layer in w.current_edit().layers], [layers[0].id, layers[2].id])
+
+    def test_dragging_selection_moves_layer_times_but_trimming_keeps_source_times(self):
+        first = Edit(1, 3, 'none', layers=[Layer(.25, 1.25)])
+        w = self.window([first, Edit(4, 5, locked=True)])
+        t = w.timeline
+        t.resize(640, 120)
+        seeks = []
+        t.seekRequested.connect(seeks.append)
+        QTest.mousePress(t, Qt.LeftButton, Qt.NoModifier, t.point_for_time(2))
+        QTest.mouseRelease(t, Qt.LeftButton, Qt.NoModifier, t.point_for_time(2.5))
+        moved = w.current_edit()
+        self.assertEqual((moved.start, moved.end), (1.5, 3.5))
+        self.assertEqual(moved.layer_span(moved.layers[0]), (1.75, 2.75))
+        QTest.mousePress(t, Qt.LeftButton, Qt.NoModifier, t.point_for_time(1.5))
+        QTest.mouseRelease(t, Qt.LeftButton, Qt.NoModifier, t.point_for_time(2))
+        trimmed = w.current_edit()
+        self.assertEqual(trimmed.layer_span(trimmed.layers[0]), (2, 2.75))
+        self.assertEqual(trimmed.layers[0].start, -.25)
+        QTest.mouseClick(t, Qt.LeftButton, Qt.NoModifier, t.point_for_time(4.5))
+        self.assertEqual(w.clip_list.currentRow(), 1)
+        QTest.mouseClick(t, Qt.LeftButton, Qt.NoModifier, t.point_for_time(2.5))
+        self.assertEqual(w.current_edit(), trimmed)
+        self.assertEqual(seeks, [])
+
+    def test_focusing_time_controls_does_not_restore_out_of_range_layer(self):
+        clip = Edit(2, 5, 'none', layers=[Layer(-2, -1)])
+        w = self.window([clip])
+        w.show()
+        w.editor_tabs.setCurrentIndex(2)
+        self.app.processEvents()
+        w.layer_panel.start.setFocus()
+        w.layer_panel.end.setFocus()
+        w.layer_panel.name.setFocus()
+        self.assertEqual(w.current_edit(), clip)
+        self.assertFalse(w.dirty)
 
     def test_zoom_pan_changes_view_only(self):
         t = Timeline()
