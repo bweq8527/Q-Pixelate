@@ -2,14 +2,16 @@ import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import tempfile
 import unittest
+from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from PySide6.QtCore import Qt, QPoint, QPointF, QMimeData
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from media_helpers import fixture
 from q_pixelate.app import MainWindow
-from q_pixelate.model import Project, Edit, Layer
+from q_pixelate.model import Project, Edit, Layer, Rect, Transform
 from q_pixelate.masks import transform_geometry
 from q_pixelate.media import probe
 from q_pixelate.process import Runner
@@ -18,6 +20,47 @@ from q_pixelate.stickers import STICKER_MIME, StickerLibrary
 
 
 class EditorUpgradeTests(unittest.TestCase):
+    def test_review_detection_marks_and_applies_once(self):
+        w = self.window([Edit(1, 2, 'none', layers=[]), Edit(3, 4, 'none', layers=[])])
+        w.editor_tabs.setCurrentWidget(w.detection_tab)
+        tracks = [SimpleNamespace(id=f'track-{i}', label='BUTTOCKS_EXPOSED', score=.9,
+                                 start=start, end=start+.1, points=[(start, Rect(.1, .2, .3, .3))])
+                  for i, start in enumerate((1.1, 1.5))]
+        w.show_detection_results((1, 2), tracks, '逐帧')
+        self.assertEqual(w.timeline.detection_spans, [(t.start, t.end) for t in tracks])
+        w.detection_results.item(1).setCheckState(Qt.CheckState.Unchecked)
+        w.apply_detection_results()
+        w.apply_detection_results()
+        self.assertEqual([(layer.kind, layer.id) for layer in w.layer_edit().layers], [('mosaic', 'track-0')])
+        w.select_edit(1)
+        self.assertEqual(w.detection_results.count(), 0)
+        w.select_edit(0)
+        self.assertEqual(w.detection_results.count(), 2)
+        w.drag_selection(0, 1, 2.25, 'right')
+        self.assertEqual(w.detection_results.count(), 0)
+        w.drag_selection(0, 1, 2, 'right')
+        self.assertEqual(w.detection_results.count(), 0)
+
+    def test_editing_legacy_selection_permanently_invalidates_detection_results(self):
+        w = self.window([Edit(1, 2, 'none')])
+        w.show_detection_results((1, 2), [SimpleNamespace(
+            id='track', label='BUTTOCKS_EXPOSED', score=.9, start=1.1, end=1.2,
+            points=[(1.1, Rect(.1, .2, .3, .3))])], '逐帧')
+        self.assertEqual(w.detection_results.count(), 1)
+        w.in_time.setValue(1.2)
+        self.assertEqual(w.detection_results.count(), 0)
+        w.in_time.setValue(1)
+        self.assertEqual(w.detection_results.count(), 0)
+
+    def test_mosaic_outline_appears_at_a_rounded_fractional_frame_position(self):
+        frame = 1001 / 30000
+        box = Rect(.1, .1, .3, .3)
+        layer = Layer(0, frame, 'mosaic', transform=Transform.from_rect(box), motion=[(0, box)])
+        w = self.window([Edit(frame, 2*frame, 'none', layers=[layer])])
+        w.info.fps = Fraction(30000, 1001)
+        w.update_canvas_mask(.033)
+        self.assertEqual(w.canvas.layers, [(0, layer)])
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import tempfile
 from dataclasses import dataclass, replace
+from fractions import Fraction
+from itertools import groupby
 from pathlib import Path
 
 from .media import index_video, probe
 from .model import Project, plan_ranges, frame_bounds, legacy_image_box
 from .process import Runner
 from .masks import mask_image, raster_layer
+from .mosaic import mask_frames
 
 
 FFMPEG = ['ffmpeg', '-hide_banner', '-v', 'warning', '-nostdin', '-y']
@@ -60,7 +64,7 @@ def effect_intervals(edits):
         for layer in edit.layers:
             start, end = edit.layer_span(layer)
             if start < end:
-                effect = 'image' if layer.kind == 'sticker' else 'region' if layer.mask else 'blur'
+                effect = {'sticker': 'image', 'mosaic': 'mosaic'}.get(layer.kind, 'region' if layer.mask else 'blur')
                 yield replace(edit, start=start, end=end, effect=effect, strength=layer.strength,
                               feather=layer.mask.feather if layer.mask else 0), layer
 
@@ -83,7 +87,7 @@ def sample_aspect(info):
 
 
 def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed=1,
-                 *, stop=None, pixel_aspect=1):
+                 *, stop=None, pixel_aspect=1, runner=None):
     """Stage assets under safe names; user paths never appear inside filter syntax."""
     graph = ['[0:v:0]setpts=PTS-STARTPTS[v0]']
     inputs = []
@@ -91,6 +95,13 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
     offset_frame = round(offset * fps)
     effects = [(edit, layer) for edit, layer in effect_intervals(edits)
                if edit.end > offset and (stop is None or edit.start < stop)]
+    groups = [list(group) for _, group in groupby(effects, lambda pair: (
+        ('mosaic', pair[0].strength) if pair[0].effect == 'mosaic' else object()))]
+    rate = Fraction(fps).limit_denominator(1_000_000)
+    frame_pts = f'settb={rate.denominator}/{rate.numerator},setpts=N'
+    has_mosaic = any(edit.effect == 'mosaic' for edit, _ in effects)
+    if has_mosaic:
+        graph[0] = f'[0:v:0]{frame_pts}[v0]'
 
     def add_input(asset):
         nonlocal image_index
@@ -113,12 +124,29 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
                       f'[hard{i}][feather{i}]blend=all_mode=multiply[mask{i}]'])
         return f'mask{i}'
 
-    for i, (edit, layer) in enumerate(effects):
+    for i, group in enumerate(groups):
+        edit, layer = group[0]
         before, after = f'v{i}', f'v{i+1}'
         first, last = frame_bounds(edit, fps)
         enable = f"gte(n,{first-offset_frame})*lt(n,{last-offset_frame})"
         radius = max(1, min(edit.strength, width // 4, height // 4))
-        if edit.effect == 'blur':
+        if edit.effect == 'mosaic':
+            if stop is None or runner is None:
+                raise ValueError('马赛克渲染需要明确的帧范围。')
+            asset = workspace / f'mosaic-{i}.nut'
+            chunks = mask_frames(group, width, height, offset_frame, round(stop*fps), fps)
+            runner.run(FFMPEG + ['-f', 'rawvideo', '-pixel_format', 'gray',
+                                 '-video_size', f'{width}x{height}', '-framerate', str(rate),
+                                 '-i', 'pipe:0', '-c:v', 'ffv1', '-f', 'nut', str(asset)], input_chunks=chunks)
+            image_index += 1
+            inputs.extend(['-i', str(asset)])
+            block = edit.strength
+            graph.extend([f'[{image_index}:v]{frame_pts},format=gbrp[coverage{i}]',
+                          f'[{before}]format=gbrp,split[base{i}][pixels{i}]',
+                          f'[pixels{i}]scale={max(1, math.ceil(width/block))}:{max(1, math.ceil(height/block))}:flags=area,'
+                          f'scale={width}:{height}:flags=neighbor,setsar={Fraction(pixel_aspect).limit_denominator()}[blocks{i}]',
+                          f'[base{i}][blocks{i}][coverage{i}]maskedmerge[{after}]'])
+        elif edit.effect == 'blur':
             graph.append(f"[{before}]boxblur=luma_radius={radius}:luma_power=2:chroma_radius={max(1, radius//2)}:enable='{enable}'[{after}]")
         elif edit.effect == 'region':
             mask = add_mask(i, edit, layer, 'gbrp')
@@ -149,9 +177,12 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
                           f"[{before}][image{i}]overlay={x}:{y}:enable='{enable}':shortest=1[{after}]"])
         else:
             graph.append(f'[{before}]null[{after}]')
-    last = f'v{len(effects)}'
+    last = f'v{len(groups)}'
     if speed != 1:
-        graph.append(f'[{last}]setpts=(PTS-STARTPTS)/{speed:.12f},fps={fps}[retimed]')
+        # Mosaic synchronizes the source and mask on whole-frame ticks. Resolve
+        # fractional frame positions before changing the video speed.
+        time_base = 'settb=AVTB,' if has_mosaic else ''
+        graph.append(f'[{last}]{time_base}setpts=(PTS-STARTPTS)/{speed:.12f},fps={fps}[retimed]')
         last = 'retimed'
     if scale:
         graph.append(f"[{last}]scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,scale=w='min({scale},iw)':h=-2[out]")
@@ -287,7 +318,7 @@ class Exporter:
                         edits = [e for e in project.edits if e.start < last/info.fps_float and e.end > start]
                         inputs, graph = effect_graph(edits, info.width, info.height, start, work, info.fps_float,
                                                      speed=count/result_count, stop=last/info.fps_float,
-                                                     pixel_aspect=sample_aspect(info))
+                                                     pixel_aspect=sample_aspect(info), runner=runner)
                         args += inputs + ['-filter_complex', graph, '-map', '[out]'] + _encoder(info)
                     else:
                         if first:
@@ -363,7 +394,7 @@ def render_preview(project: Project, edit_index: int, destination, runner: Runne
         count = output_frames(first, last, edit.speed)
         effective = (last-first)/count
         inputs, graph = effect_graph([edit], info.width, info.height, start, Path(directory), info.fps_float, 960, effective,
-                                     stop=last/info.fps_float, pixel_aspect=sample_aspect(info))
+                                     stop=last/info.fps_float, pixel_aspect=sample_aspect(info), runner=runner)
         audio_maps = ['-map', '0:a?']
         if edit.speed != 1 and info.audio:
             # Input seek resets timestamps; express the preview edit on that local timeline.

@@ -78,6 +78,8 @@ class VideoCanvas(QWidget):
         self.draw_new = True
         self.setAcceptDrops(True)
         self.layers = []
+        self.layer_source_time = 0
+        self.detection_boxes = []
         self.layer_target = None
         self.free_transform = False
         self.layer_gesture = None
@@ -151,6 +153,9 @@ class VideoCanvas(QWidget):
                 if layer.image not in self.sticker_images:
                     self.sticker_images[layer.image] = QImage(layer.image)
                 paint_sticker(painter, layer, self.sticker_images[layer.image], box)
+            elif layer.kind == 'mosaic':
+                rect = layer.mosaic_rect_at(self.layer_source_time-layer.start)
+                self.paint_detection_box(painter, box, rect)
             elif layer.mask:
                 painter.save()
                 painter.setClipRect(box)
@@ -159,6 +164,8 @@ class VideoCanvas(QWidget):
                 painter.setPen(QPen(QColor('#6ee7c0'), 1, Qt.PenStyle.DashLine))
                 painter.drawPath(path)
                 painter.restore()
+        for rect in self.detection_boxes:
+            self.paint_detection_box(painter, box, rect)
         if self.layer_target is not None and self.mask_shape is None:
             transform, mask = self.layer_target
             matrix, local = transform_geometry(transform, box)
@@ -188,6 +195,16 @@ class VideoCanvas(QWidget):
                     painter.drawEllipse(area)
                 else:
                     painter.drawRect(area)
+
+    @staticmethod
+    def paint_detection_box(painter, box, rect):
+        painter.save()
+        painter.setClipRect(box)
+        path = mask_path('rect', rect, [], box)
+        painter.fillPath(path, QColor(255, 184, 107, 28))
+        painter.setPen(QPen(QColor('#ffb86b'), 2, Qt.PenStyle.DashLine))
+        painter.drawPath(path)
+        painter.restore()
 
     @staticmethod
     def handles(local):
@@ -249,6 +266,8 @@ class VideoCanvas(QWidget):
             if layer.kind == 'sticker':
                 matrix, local = transform_geometry(layer.transform, box)
                 inside = local.contains(matrix.inverted()[0].map(position))
+            elif layer.kind == 'mosaic':
+                inside = mask_path('rect', layer.mosaic_rect_at(self.layer_source_time-layer.start), [], box).contains(position)
             else:
                 inside = bool(layer.mask and layer_mask_path(layer.mask, box).contains(position))
             if inside:
@@ -410,6 +429,7 @@ class Timeline(QWidget):
         self.position = 0
         self.selection = (0, 0)
         self.edits = []
+        self.detection_spans = []
         self.zoom = 1
         self.view_start = 0
         self.drag = None
@@ -480,6 +500,9 @@ class Timeline(QWidget):
         if not self.selection_locked or self.candidate:
             for x in (left, right):
                 p.fillRect(QRectF(x-3, 60, 6, 42), QColor('#6ee7c0'))
+        for start, end in self.detection_spans:
+            x1, x2 = self.point_for_time(start).x(), self.point_for_time(end).x()
+            p.fillRect(QRectF(x1, 96, max(2, x2-x1), 4), QColor('#ffb86b'))
         x = self.point_for_time(self.position).x()
         p.setPen(QPen(QColor('#ffb86b'), 2))
         p.drawLine(x, 34, x, 52)

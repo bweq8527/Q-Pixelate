@@ -75,7 +75,7 @@ class LayerEditing:
         panel.delete.setEnabled(editable and layer is not None)
         panel.details.setVisible(layer is not None)
         panel.details.setEnabled(editable)
-        panel.redraw.setEnabled(editable and bool(layer))
+        panel.redraw.setEnabled(editable and bool(layer) and layer.kind != 'mosaic')
         if not layer:
             return
         panel.name.setText(layer.name)
@@ -85,8 +85,11 @@ class LayerEditing:
         panel.start.setValue(start if start < end else edit.start)
         panel.end.setValue(end if start < end else edit.end)
         panel.start.setToolTip('图层超出选区，修改时间可恢复显示' if start >= end else '')
-        panel.kind.setCurrentIndex(0 if layer.kind == 'blur' else 1)
-        panel.kind.setEnabled(layer.mask is not None)
+        panel.kind.setCurrentIndex(panel.kind.findData(layer.kind))
+        mosaic = layer.kind == 'mosaic'
+        panel.kind.setEnabled(layer.mask is not None and not mosaic)
+        # Only tracked regions can use the mosaic entry.
+        panel.kind.model().item(panel.kind.findData('mosaic')).setEnabled(mosaic)
         sticker = layer.kind == 'sticker'
         panel.target.setEnabled(sticker and layer.mask is not None)
         panel.target.setCurrentIndex(1 if self._layer_target == 'mask' else 0)
@@ -94,12 +97,14 @@ class LayerEditing:
         panel.asset.setEnabled(sticker or layer.mask is not None)
         panel.strength.setEnabled(not sticker)
         panel.strength.setValue(layer.strength)
+        panel.strength_label.setText('马赛克块大小' if mosaic else '模糊强度')
+        panel.strength.setSuffix(' px' if mosaic else '')
         panel.feather.setEnabled(layer.mask is not None)
         panel.feather.setValue(layer.mask.feather if layer.mask else 0)
         transform = self.target_transform(layer)
-        panel.transform.setEnabled(transform is not None)
+        panel.transform.setEnabled(transform is not None and not mosaic)
         for spin in panel.geometry:
-            spin.setEnabled(transform is not None)
+            spin.setEnabled(transform is not None and (not mosaic or spin is not panel.geometry[-1]))
         if transform:
             for spin, value in zip(panel.geometry, (transform.x*100, transform.y*100, transform.w*100,
                                                     transform.h*100, (transform.angle+180)%360-180)):
@@ -109,6 +114,8 @@ class LayerEditing:
     def target_transform(self, layer):
         if layer is None:
             return None
+        if layer.kind == 'mosaic':
+            return layer.transform
         if self._layer_target == 'mask' or layer.kind == 'blur':
             return layer.mask.transform if layer.mask else None
         return layer.transform
@@ -266,10 +273,10 @@ class LayerEditing:
     def set_layer_kind(self, _):
         edit = self.layer_edit()
         layer = self.selected_layer(edit)
-        if not layer or edit.locked:
+        if not layer or edit.locked or layer.kind == 'mosaic':
             return
         kind = self.layer_panel.kind.currentData()
-        if kind == layer.kind:
+        if kind == layer.kind or kind == 'mosaic':
             return
         if kind == 'sticker':
             if layer.image:
@@ -300,8 +307,9 @@ class LayerEditing:
 
     def begin_transform(self):
         edit = self.layer_edit()
-        transform = self.target_transform(self.selected_layer(edit))
-        if not transform or edit.locked:
+        layer = self.selected_layer(edit)
+        transform = self.target_transform(layer)
+        if not transform or edit.locked or layer.kind == 'mosaic':
             return False
         if self.canvas.free_transform:
             self.canvas.setFocus()
@@ -330,7 +338,9 @@ class LayerEditing:
         layer = self.selected_layer(self.layer_edit())
         if not layer:
             return
-        if self._layer_target == 'mask' or layer.kind == 'blur':
+        if layer.kind == 'mosaic':
+            self.update_layer(transform=replace(transform, angle=0))
+        elif self._layer_target == 'mask' or layer.kind == 'blur':
             if layer.mask:
                 self.update_layer(mask=replace(layer.mask, transform=transform))
         else:
@@ -358,7 +368,11 @@ class LayerEditing:
             self.sync_layer_editor()
             return
         self.select_layer(index)
-        self.update_layer(start=start-edit.start, end=end-edit.start)
+        new_start = start-edit.start
+        updates = {'start': new_start, 'end': end-edit.start}
+        if layer.motion and abs((end-start)-(layer.end-layer.start)) > .0005:
+            updates['motion'] = [(time+layer.start-new_start, box) for time, box in layer.motion]
+        self.update_layer(**updates)
 
     def reorder_layer(self, offset):
         edit = self.layer_edit()

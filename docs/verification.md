@@ -1,5 +1,22 @@
 # 验证记录 · 2026-11-20
 
+## 便携组件与自动马赛克
+
+`python -m unittest discover -s tests -v` 通过 85 项测试。`python -m compileall -q q_pixelate launcher.py scripts` 通过。新增验证覆盖离线安装、包校验与回滚、启动目录迁移、精确选区采样、同屏目标、切镜、取消、标注审核、移动遮罩及变速导出。在本机 HTTP 服务上实际下载安装了 320n 组件，确认了 SHA-256 校验和卸载。
+
+在当前 Windows 主机上，使用没有系统 Python 或 FFmpeg 路径的进程环境，从空目录启动打包后的 EXE。安装私有基础环境和 FFmpeg 后，编辑器能打开传入的视频参数，重启时可直接进入编辑器。尚未在全新 Windows 虚拟机单独执行安装验收。
+
+使用私有 Python 3.12.10 运行两个真实 NudeNet 模型。测试视频为 6 秒、640×360、20 fps 的合成 H.264 视频，以约 5 帧/秒扫描 30 帧。时间包含模型初始化。GPU 为 RTX 4070 SUPER，驱动版本 621.24，ONNX Runtime 跟踪确认实际执行 CUDA 算子。
+
+| 模型 | CPU 扫描 | CUDA 扫描 | CUDA 额外显存约数 |
+| --- | ---: | ---: | ---: |
+| 320n | 1.88 秒 | 2.06 秒 | 229 MiB |
+| 640m | 13.30 秒 | 2.48 秒 | 687 MiB |
+
+合成片用于验证推理和耗时，移动区域与多目标由可重复的标注测试验证。实际真人、游戏和动画素材的漏检率与误报率尚未测量。
+
+## 编辑器验证
+
 `python -m unittest discover -s tests -v`: 51 tests passed (39.265s). `python -m compileall -q q_pixelate`: passed.
 
 Added real FFmpeg checks for per-clip speed and preview, two speed changes inside one GOP, 0.25× at EOF, 3× fractional FPS without audio, all audio tracks/language retention and delayed audio onset. A 6-second 120-frame fixture with 2–4s at 2× produces 100 frames/5 seconds; original prefix and shifted tail frame hashes remain identical.

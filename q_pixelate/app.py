@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,6 +20,9 @@ from PySide6.QtWidgets import (
 )
 
 from .jobs import Worker
+from .auto_mosaic import AutomaticMosaic
+from .component_dialog import ComponentDialog
+from .components import ComponentManager
 from .layer_editor import LayerEditing
 from .layer_widgets import LayerInspector, LayerTimeline, StickerList
 from .media import probe
@@ -118,13 +122,14 @@ class PreviewDialog(QDialog):
         event.accept()
 
 
-class MainWindow(QMainWindow, LayerEditing):
+class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Q-Pixelate · 长视频局部打码')
         self.resize(1390, 960)
         self.setMinimumSize(1040, 760)
         self.setStyleSheet(STYLE)
+        self.components = ComponentManager()
         self.project = None
         self.info = None
         self.project_path = None
@@ -170,7 +175,9 @@ class MainWindow(QMainWindow, LayerEditing):
         self.load_button = button('载入工程', self.choose_project)
         self.save_button = button('保存工程', self.save_project)
         self.export_button = button('缝合导出  ↗', self.choose_export, True)
-        for widget in (self.open_button, self.load_button, self.save_button, self.export_button):
+        self.settings_button = button('设置', self.open_components)
+        self.settings_button.setToolTip('环境与组件')
+        for widget in (self.open_button, self.load_button, self.save_button, self.settings_button, self.export_button):
             header.addWidget(widget)
         layout.addLayout(header)
         self.source_label = label('选择源视频；文件全程在本机处理。')
@@ -340,6 +347,7 @@ class MainWindow(QMainWindow, LayerEditing):
         self.editor_tabs.addTab(library, '贴纸素材')
         self.editor_tabs.addTab(layer_properties, '图层属性')
         self.editor_tabs.setCurrentWidget(library)
+        self.setup_detection_tab()
         editor_panel = QWidget()
         editor_panel.setMinimumWidth(375)
         editor_layout = QVBoxLayout(editor_panel)
@@ -429,6 +437,7 @@ class MainWindow(QMainWindow, LayerEditing):
         self.body.setEnabled(not busy and self.project is not None)
         self.open_button.setEnabled(not busy)
         self.load_button.setEnabled(not busy)
+        self.settings_button.setEnabled(not busy)
         self.save_button.setEnabled(not busy and self.project is not None)
         self.export_button.setEnabled(not busy and self.project is not None)
         self.cancel_button.setVisible(busy)
@@ -438,6 +447,29 @@ class MainWindow(QMainWindow, LayerEditing):
         self.status.setText(text.splitlines()[0])
         if text != '任务已取消。':
             QMessageBox.warning(self, 'Q-Pixelate', text)
+
+    def open_components(self):
+        dialog = ComponentDialog(self.components, self)
+        dialog.handoff.connect(self.handoff_component_action)
+        dialog.exec()
+        dialog.deleteLater()
+        if not self._closing:
+            self.sync_detection()
+
+    def handoff_component_action(self, action, key, archive):
+        launcher = os.environ.get('QPIXELATE_LAUNCHER')
+        if not launcher or not Path(launcher).is_file():
+            self.error('找不到启动器，请重新启动 Q-Pixelate。')
+            return
+        arguments = [launcher, '--component-action', action, key]
+        if archive:
+            arguments.append(archive)
+        arguments.extend(['--wait-pid', str(os.getpid()), '--'])
+        if self.close():
+            try:
+                subprocess.Popen(arguments)
+            except OSError as exc:
+                QMessageBox.warning(None, 'Q-Pixelate', f'无法打开组件启动器：{exc}')
 
     def start_job(self, task, callback):
         if self.worker is not None and self.worker.isRunning():
@@ -501,6 +533,7 @@ class MainWindow(QMainWindow, LayerEditing):
         self._loading_form = True
         self._editing_row = -1
         self._drafts.clear()
+        self.detection_batches.clear()
         self._range_locked = False
         self.project, self.info = project, info
         self.project_path = None
@@ -589,6 +622,8 @@ class MainWindow(QMainWindow, LayerEditing):
             return
         current = self.current_edit()
         stored = self.project.edits[row]
+        if self._active_detection_key != (current.start, current.end):
+            self.detection_batches.pop(self._active_detection_key, None)
         if current != stored:
             self.changed()
         if current.layers is not None:
@@ -598,7 +633,7 @@ class MainWindow(QMainWindow, LayerEditing):
             self.clip_list.item(row).setText(self.edit_caption(row, edit))
             self.layer_timeline.update()
             self.sync_layer_editor()
-            self.update_canvas_mask()
+        self.sync_detection()
 
     def set_selection(self, start, end):
         if self._range_locked and not self._loading_form:
@@ -768,6 +803,8 @@ class MainWindow(QMainWindow, LayerEditing):
         del blocker
         if selected >= 0:
             self.select_edit(selected)
+        else:
+            self.sync_detection()
 
     def edit_caption(self, row, edit):
         names = {'blur': '全屏模糊', 'region': '区域模糊', 'image': '贴纸遮挡', 'none': '仅变速'}
@@ -942,7 +979,7 @@ class MainWindow(QMainWindow, LayerEditing):
                                     '在选区轨右键拖动，或输入入点和出点后添加选区')
         self.timeline.update()
         self.sync_layer_editor()
-        self.update_canvas_mask()
+        self.sync_detection()
 
     def toggle_range_lock(self):
         if self.selected_locked():
@@ -1070,19 +1107,27 @@ class MainWindow(QMainWindow, LayerEditing):
         playing = hasattr(self, 'player') and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState and not self._pause_on_frame
         seconds = self.timeline.position if seconds is None else seconds
         selected = self.layer_edit()
+        frame_time = round(seconds*self.info.fps_float)/self.info.fps_float if self.info else seconds
         active_row = next((i for i, edit in enumerate(self.timeline.edits) if edit.start <= seconds < edit.end), -1)
+        if 0 < abs(frame_time-seconds) < .00051:
+            active_row = next((i for i, edit in enumerate(self.timeline.edits)
+                               if edit.start <= frame_time < edit.end and edit.layers and
+                               any(layer.kind == 'mosaic' for layer in edit.layers)), active_row)
         active = self.timeline.edits[active_row] if self.project and active_row >= 0 else None
         self._canvas_layer_row = active_row
         self.canvas.layers = []
         self.canvas.layer_target = None
+        self.canvas.detection_boxes = self.detection_boxes_at(seconds)
         if active and active.layers is not None:
+            self.canvas.layer_source_time = frame_time-active.start
             self.canvas.layers = [(i, layer) for i, layer in enumerate(active.layers)
-                                  if (span := active.layer_span(layer))[0] <= seconds < span[1]]
+                                  if (span := active.layer_span(layer))[0] <= (
+                                      frame_time if layer.kind == 'mosaic' else seconds) < span[1]]
         if selected:
             if not playing and not selected.locked:
                 layer = self.selected_layer(selected)
                 transform = self.target_transform(layer)
-                if transform:
+                if transform and layer.kind != 'mosaic':
                     mask = layer.mask if self._layer_target == 'mask' else None
                     self.canvas.layer_target = transform, mask
             self.canvas.show_mask = False

@@ -77,20 +77,51 @@ class Layer:
     mask: Mask | None = None
     strength: int = 20
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    motion: list[tuple[float, Rect]] = field(default_factory=list)
+
+    def mosaic_rect_at(self, elapsed):
+        """Interpolate source boxes, then apply the user's edit to the whole track."""
+        index = bisect.bisect_right(self.motion, elapsed, key=lambda point: point[0])
+        reference = self.motion[0][1]
+        if index == 0:
+            box = reference
+        elif index == len(self.motion):
+            box = self.motion[-1][1]
+        else:
+            a, first = self.motion[index-1]
+            b, second = self.motion[index]
+            t = (elapsed-a)/(b-a)
+            box = Rect(first.x+(second.x-first.x)*t, first.y+(second.y-first.y)*t,
+                       first.w+(second.w-first.w)*t, first.h+(second.h-first.h)*t)
+        transform = self.transform
+        sx, sy = transform.w/reference.w, transform.h/reference.h
+        return Rect(transform.x-transform.w/2+(box.x-reference.x)*sx,
+                    transform.y-transform.h/2+(box.y-reference.y)*sy, box.w*sx, box.h*sy)
 
     def validate(self):
         if (any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in (self.start, self.end))
                 or self.start >= self.end):
             raise ValueError('图层时间范围无效。')
-        if self.kind not in ('blur', 'sticker') or not isinstance(self.name, str) or not isinstance(self.id, str) or not self.id:
+        if self.kind not in ('blur', 'sticker', 'mosaic') or not isinstance(self.name, str) or not isinstance(self.id, str) or not self.id:
             raise ValueError('图层类型或名称无效。')
         if not isinstance(self.strength, int) or not 1 <= self.strength <= 100:
-            raise ValueError('模糊强度须为 1–100。')
+            raise ValueError('模糊强度或马赛克块大小须为 1–100。')
         if not isinstance(self.image, str) or (self.kind == 'sticker' and not Path(self.image).is_file()):
             raise ValueError('贴纸图片不存在，请重新选择素材。')
         self.transform.validate()
         if self.mask is not None:
             self.mask.validate()
+        if self.kind == 'mosaic':
+            if not self.motion or self.mask or self.image or self.transform.angle:
+                raise ValueError('马赛克图层需要矩形轨迹。')
+            previous = -math.inf
+            for timestamp, box in self.motion:
+                if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp) or timestamp <= previous:
+                    raise ValueError('马赛克轨迹时间无效。')
+                box.validate()
+                previous = timestamp
+        elif self.motion:
+            raise ValueError('仅马赛克图层支持自动遮挡轨迹。')
 
 
 @dataclass
@@ -229,8 +260,12 @@ class Project:
                 raw = {key: raw[key] for key in ('start', 'end', 'speed', 'locked', 'range_locked', 'layers')}
                 for layer in raw['layers']:
                     layer['image'] = relative(layer['image'])
+                    if not layer['motion']:
+                        layer.pop('motion')
             edits.append(raw)
-        data = {'version': 3 if any(e.layers is not None for e in self.edits) else 2, 'source': relative(self.source),
+        version = (4 if any(layer.kind == 'mosaic' for e in self.edits for layer in e.layers or [])
+                   else 3 if any(e.layers is not None for e in self.edits) else 2)
+        data = {'version': version, 'source': relative(self.source),
                 'fingerprint': self.fingerprint, 'edits': edits}
         name = None
         try:
@@ -248,7 +283,7 @@ class Project:
         path = Path(path).resolve()
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
-            if not isinstance(data, dict) or data.get('version') not in (1, 2, 3):
+            if not isinstance(data, dict) or data.get('version') not in (1, 2, 3, 4):
                 raise ValueError('工程格式或版本不受支持。')
             def absolute(value):
                 if not isinstance(value, str):
@@ -263,6 +298,8 @@ class Project:
                         item = dict(item)
                         item['image'] = absolute(item.get('image', ''))
                         item['transform'] = Transform(**item.get('transform', {}))
+                        if 'motion' in item:
+                            item['motion'] = [(timestamp, Rect(**box)) for timestamp, box in item['motion']]
                         if item.get('mask') is not None:
                             mask = dict(item['mask'])
                             mask['transform'] = Transform(**mask.get('transform', {}))

@@ -17,6 +17,7 @@ class Runner:
         self.cancel_event = cancel_event or threading.Event()
         self.progress = progress or (lambda value, text: None)
         self.log = log or (lambda text: None)
+        self._video_tools = None
 
     def check(self):
         if self.cancel_event.is_set():
@@ -26,15 +27,24 @@ class Runner:
         self.check()
         self.progress(max(0, min(100, int(value))), text)
 
-    def run(self, args, duration=None, base=0, weight=0):
+    def executable(self, name):
+        if str(name) in ('ffmpeg', 'ffprobe'):
+            if self._video_tools is None:
+                from .components import ComponentManager
+                self._video_tools = ComponentManager().ffmpeg_tools()
+            return self._video_tools.get(name)
+        return shutil.which(str(name))
+
+    def run(self, args, duration=None, base=0, weight=0, *, input_chunks=None):
         self.check()
         args = [str(arg) for arg in args]
-        executable = shutil.which(args[0])
+        executable = self.executable(args[0])
         if not executable:
-            raise ValueError(f'找不到 {args[0]}。请安装 FFmpeg 并将 bin 目录加入 PATH。')
+            raise ValueError(f'找不到 {args[0]}。请从「设置 → 环境与组件」安装或指定 FFmpeg。')
         args[0] = executable
         self.log(subprocess.list2cmdline(args))
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   stdin=subprocess.PIPE if input_chunks is not None else subprocess.DEVNULL,
                                    text=True, encoding='utf-8', errors='replace',
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         output = []
@@ -53,6 +63,25 @@ class Runner:
                 errors.append(line)
         threads = [threading.Thread(target=read_stdout, daemon=True),
                    threading.Thread(target=read_stderr, daemon=True)]
+        input_errors = []
+
+        def write_stdin():
+            try:
+                for chunk in input_chunks:
+                    self.check()
+                    process.stdin.buffer.write(chunk)
+            except (BrokenPipeError, Cancelled):
+                pass
+            except Exception as exc:
+                input_errors.append(exc)
+            finally:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+
+        if input_chunks is not None:
+            threads.append(threading.Thread(target=write_stdin, daemon=True))
         for thread in threads:
             thread.start()
         try:
@@ -76,6 +105,8 @@ class Runner:
         error_text = ''.join(errors)
         if error_text:
             self.log(error_text)
+        if input_errors:
+            raise input_errors[0]
         if process.returncode:
             raise ValueError(f'FFmpeg 操作失败（{process.returncode}）：\n{error_text[-5000:]}')
         return ''.join(output)

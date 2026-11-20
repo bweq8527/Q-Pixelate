@@ -1,0 +1,141 @@
+{
+  "assets": {
+    "python-3.12.10-embed-amd64.zip": {
+      "url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
+      "sha256": "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3"
+    },
+    "ffmpeg-8.0.1-essentials_build.zip": {
+      "url": "https://github.com/GyanD/codexffmpeg/releases/download/8.0.1/ffmpeg-8.0.1-essentials_build.zip",
+      "sha256": "e2aaeaa0fdbc397d4794828086424d4aaa2102cef1fb6874f6ffd29c0b88b673"
+    },
+    "NudeNet-LICENSE": {
+      "url": "https://raw.githubusercontent.com/notAI-tech/NudeNet/v3.4-weights/LICENSE",
+      "sha256": "8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef"
+    },
+    "nudenet-3.4.2-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/1c/ee/1aa02d44ba958cc77e16ff1e41a0aac5e721037db7bf62b9c9d124917f87/nudenet-3.4.2-py3-none-any.whl",
+      "sha256": "5937dbd84e5d8e5de038f08ffea5a1bb50a08475776bf2b4795914ce0eaf0331"
+    },
+    "640m.onnx": {
+      "url": "https://huggingface.co/Kalashnikov/NudeNet/resolve/9f7923d6c0c434c445d5d9df62a8dcecd44b7292/640m.onnx",
+      "sha256": "04fe3d77980780c1f8297dc6d7f942fd5b3abe6942a188f742a85241e4f634eb"
+    }
+  },
+  "wheels": {
+    "PySide6": {
+      "filename": "pyside6-6.11.2-cp310-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/94/fe/4aea9d30300fff4cda9bb729c1363b9e1095a8544e0d6b57065465e16599/pyside6-6.11.2-cp310-abi3-win_amd64.whl",
+      "sha256": "3201d67e3c10be2eaedd3910ff0f02351eca7e88c95a291cde5e7f2f55ef207f"
+    },
+    "PySide6-Essentials": {
+      "filename": "pyside6_essentials-6.11.2-cp310-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/dc/09/d2662684aee4d3f027ff9b1e965f22301bc28ffc5b7f167658508e4475dc/pyside6_essentials-6.11.2-cp310-abi3-win_amd64.whl",
+      "sha256": "c8a29def77032773a30879f7f24415b5395ad08592d147c170824ef4c735dfc1"
+    },
+    "PySide6-Addons": {
+      "filename": "pyside6_addons-6.11.2-cp310-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/fb/c1/08bf6594101b42fc88834009f1dac59a983c5b6805c62c5081f077d09b4a/pyside6_addons-6.11.2-cp310-abi3-win_amd64.whl",
+      "sha256": "f449ea4431da20e7b86752cca8d166f93434516fe417f981c27e5f8e1b554407"
+    },
+    "shiboken6": {
+      "filename": "shiboken6-6.11.2-cp310-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/ce/6b/fee1b4814317e4664e318644c9c007676c65a71e5b2b9d3ac4121a94dc0a/shiboken6-6.11.2-cp310-abi3-win_amd64.whl",
+      "sha256": "6ab0eba1c904455df621f9a6df3ca2bb896bab8670572d2bc4e37804ae91f19a"
+    },
+    "numpy": {
+      "filename": "numpy-2.2.6-cp312-cp312-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/36/fa/8c9210162ca1b88529ab76b41ba02d433fd54fecaf6feb70ef9f124683f1/numpy-2.2.6-cp312-cp312-win_amd64.whl",
+      "sha256": "c1f9540be57940698ed329904db803cf7a402f3fc200bfe599334c9bd84a40b2"
+    },
+    "opencv-python-headless": {
+      "filename": "opencv_python_headless-4.12.0.88-cp37-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/f2/35/0858e9e71b36948eafbc5e835874b63e515179dc3b742cbe3d76bc683439/opencv_python_headless-4.12.0.88-cp37-abi3-win_amd64.whl",
+      "sha256": "86b413bdd6c6bf497832e346cd5371995de148e579b9774f8eba686dee3f5528"
+    },
+    "onnxruntime": {
+      "filename": "onnxruntime-1.22.0-cp312-cp312-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/36/b4/3f1c71ce1d3d21078a6a74c5483bfa2b07e41a8d2b8fb1e9993e6a26d8d3/onnxruntime-1.22.0-cp312-cp312-win_amd64.whl",
+      "sha256": "c0d534a43d1264d1273c2d4f00a5a588fa98d21117a3345b7104fa0bbcaadb9a"
+    },
+    "onnxruntime-gpu": {
+      "filename": "onnxruntime_gpu-1.22.0-cp312-cp312-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/48/9e/f95af15627c8b9f866f2e372e467a9f1e14e7ebec224ed4b8e71ce970c81/onnxruntime_gpu-1.22.0-cp312-cp312-win_amd64.whl",
+      "sha256": "89cfd71e1ba17a4668e8770e344f22cde64bfd70b2ad3d03b8a390d4414b5995"
+    },
+    "coloredlogs": {
+      "filename": "coloredlogs-15.0.1-py2.py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/a7/06/3d6badcf13db419e25b07041d9c7b4a2c331d3f4e7134445ec5df57714cd/coloredlogs-15.0.1-py2.py3-none-any.whl",
+      "sha256": "612ee75c546f53e92e70049c9dbfcc18c935a2b9a53b66085ce9ef6a6e5c0934"
+    },
+    "humanfriendly": {
+      "filename": "humanfriendly-10.0-py2.py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/f0/0f/310fb31e39e2d734ccaa2c0fb981ee41f7bd5056ce9bc29b2248bd569169/humanfriendly-10.0-py2.py3-none-any.whl",
+      "sha256": "1697e1a8a8f550fd43c2865cd84542fc175a61dcb779b6fee18cf6b6ccba1477"
+    },
+    "pyreadline3": {
+      "filename": "pyreadline3-3.5.4-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/5a/dc/491b7661614ab97483abf2056be1deee4dc2490ecbf7bff9ab5cdbac86e1/pyreadline3-3.5.4-py3-none-any.whl",
+      "sha256": "eaf8e6cc3c49bcccf145fc6067ba8643d1df34d604a1ec0eccbf7a18e6d3fae6"
+    },
+    "flatbuffers": {
+      "filename": "flatbuffers-25.2.10-py2.py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/b8/25/155f9f080d5e4bc0082edfda032ea2bc2b8fab3f4d25d46c1e9dd22a1a89/flatbuffers-25.2.10-py2.py3-none-any.whl",
+      "sha256": "ebba5f4d5ea615af3f7fd70fc310636fbb2bbd1f566ac0a23d98dd412de50051"
+    },
+    "packaging": {
+      "filename": "packaging-25.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/20/12/38679034af332785aac8774540895e234f4d07f7545804097de4b666afd8/packaging-25.0-py3-none-any.whl",
+      "sha256": "29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484"
+    },
+    "sympy": {
+      "filename": "sympy-1.14.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/a2/09/77d55d46fd61b4a135c444fc97158ef34a095e5681d0a6c10b75bf356191/sympy-1.14.0-py3-none-any.whl",
+      "sha256": "e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5"
+    },
+    "mpmath": {
+      "filename": "mpmath-1.3.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl",
+      "sha256": "a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c"
+    },
+    "nvidia-cuda-runtime-cu12": {
+      "filename": "nvidia_cuda_runtime_cu12-12.8.90-py3-none-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/30/a5/a515b7600ad361ea14bfa13fb4d6687abf500adc270f19e89849c0590492/nvidia_cuda_runtime_cu12-12.8.90-py3-none-win_amd64.whl",
+      "sha256": "c0c6027f01505bfed6c3b21ec546f69c687689aad5f1a377554bc6ca4aa993a8"
+    },
+    "nvidia-cuda-nvrtc-cu12": {
+      "filename": "nvidia_cuda_nvrtc_cu12-12.8.93-py3-none-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/45/51/52a3d84baa2136cc8df15500ad731d74d3a1114d4c123e043cb608d4a32b/nvidia_cuda_nvrtc_cu12-12.8.93-py3-none-win_amd64.whl",
+      "sha256": "7a4b6b2904850fe78e0bd179c4b655c404d4bb799ef03ddc60804247099ae909"
+    },
+    "nvidia-cufft-cu12": {
+      "filename": "nvidia_cufft_cu12-11.3.3.83-py3-none-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/7d/ec/ce1629f1e478bb5ccd208986b5f9e0316a78538dd6ab1d0484f012f8e2a1/nvidia_cufft_cu12-11.3.3.83-py3-none-win_amd64.whl",
+      "sha256": "7a64a98ef2a7c47f905aaf8931b69a3a43f27c55530c698bb2ed7c75c0b42cb7"
+    },
+    "nvidia-cublas-cu12": {
+      "filename": "nvidia_cublas_cu12-12.8.4.1-py3-none-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/70/61/7d7b3c70186fb651d0fbd35b01dbfc8e755f69fd58f817f3d0f642df20c3/nvidia_cublas_cu12-12.8.4.1-py3-none-win_amd64.whl",
+      "sha256": "47e9b82132fa8d2b4944e708049229601448aaad7e6f296f630f2d1a32de35af"
+    },
+    "nvidia-cudnn-cu12": {
+      "filename": "nvidia_cudnn_cu12-9.8.0.87-py3-none-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/39/6a/5e9910b2b2c9dcddee9aaef372b3db0f08b9f7eaf1d462f859461a79caf9/nvidia_cudnn_cu12-9.8.0.87-py3-none-win_amd64.whl",
+      "sha256": "b4b5cfddc32aa4180f9d390ee99e9a9f55a89e7087329b41aba4319327e22466"
+    },
+    "nvidia-nvjitlink-cu12": {
+      "filename": "nvidia_nvjitlink_cu12-12.8.93-py3-none-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/ed/d7/34f02dad2e30c31b10a51f6b04e025e5dd60e5f936af9045a9b858a05383/nvidia_nvjitlink_cu12-12.8.93-py3-none-win_amd64.whl",
+      "sha256": "bd93fbeeee850917903583587f4fc3a4eafa022e34572251368238ab5e6bd67f"
+    },
+    "protobuf": {
+      "filename": "protobuf-6.31.1-cp310-abi3-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/44/3a/b15c4347dd4bf3a1b0ee882f384623e2063bb5cf9fa9d57990a4f7df2fb6/protobuf-6.31.1-cp310-abi3-win_amd64.whl",
+      "sha256": "426f59d2964864a1a366254fa703b8632dcec0790d8862d30034d8245e1cd447"
+    },
+    "nvidia-curand-cu12": {
+      "filename": "nvidia_curand_cu12-10.3.9.90-py3-none-win_amd64.whl",
+      "url": "https://files.pythonhosted.org/packages/b9/75/70c05b2f3ed5be3bb30b7102b6eb78e100da4bbf6944fd6725c012831cab/nvidia_curand_cu12-10.3.9.90-py3-none-win_amd64.whl",
+      "sha256": "f149a8ca457277da854f89cf282d6ef43176861926c7ac85b2a0fbd237c587ec"
+    }
+  }
+}

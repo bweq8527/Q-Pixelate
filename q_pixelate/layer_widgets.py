@@ -80,6 +80,7 @@ class LayerInspector(QWidget):
         self.kind = QComboBox()
         self.kind.addItem('模糊', 'blur')
         self.kind.addItem('贴纸', 'sticker')
+        self.kind.addItem('马赛克', 'mosaic')
         form.addRow('遮罩用途', self.kind)
         self.asset = QPushButton('使用素材库选中的贴纸')
         form.addRow(self.asset)
@@ -93,6 +94,7 @@ class LayerInspector(QWidget):
         self.feather = self.spin(0, 20)
         self.feather.setSuffix(' %')
         form.addRow('模糊强度', self.strength)
+        self.strength_label = form.labelForField(self.strength)
         form.addRow('向内羽化', self.feather)
         self.geometry = []
         for name, lo, hi in [('中心 X %', -400, 500), ('中心 Y %', -400, 500),
@@ -151,13 +153,13 @@ class LayerTimeline(QWidget):
             start, end = self.candidate if self.drag and self.drag[0] == index else self.edit.layer_span(layer)
             if start < end:
                 left, right = (self.timeline.point_for_time(t).x() for t in (start, end))
-                color = QColor('#7864a6' if layer.kind == 'sticker' else '#317569')
+                color = QColor({'sticker': '#7864a6', 'mosaic': '#93664c'}.get(layer.kind, '#317569'))
                 painter.fillRect(QRectF(left, y+3, max(2, right-left), self.row_height-5), color)
                 if index == self.selected:
                     painter.setPen(QPen(QColor('#d5fff1'), 1))
                     painter.drawRect(QRectF(left, y+3, max(2, right-left), self.row_height-5))
             painter.setPen(QColor('#e5edf8'))
-            text = layer.name or ('贴纸' if layer.kind == 'sticker' else '模糊')
+            text = layer.name or {'sticker': '贴纸', 'mosaic': '马赛克', 'blur': '模糊'}[layer.kind]
             painter.drawText(26, y+17, f'{index+1:02}  {text}' + (' · 范围外' if start >= end else ''))
             painter.restore()
         x = self.timeline.point_for_time(self.timeline.position).x()
