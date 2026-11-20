@@ -431,11 +431,14 @@ class Timeline(QWidget):
         self.view_start = 0
         self.update()
 
-    def set_zoom(self, zoom):
+    def set_zoom(self, zoom, *, anchor_x=None):
+        anchor_time = self.position
+        fraction = .5
+        if anchor_x is not None:
+            fraction = max(0, min(1, (anchor_x-20)/max(1, self.width()-40)))
+            anchor_time = self.view_start+fraction*self.visible
         self.zoom = zoom
-        self.view_start = max(0, min(self.duration-self.visible, self.position-self.visible/2))
-        self.viewChanged.emit(self.view_start)
-        self.update()
+        self.set_view_start(anchor_time-fraction*self.visible)
 
     def point_for_time(self, time):
         return QPoint(round(20+(time-self.view_start)/max(.001, self.visible)*(self.width()-40)), 76)
@@ -597,8 +600,10 @@ class Timeline(QWidget):
         self.update()
 
     def wheelEvent(self, event):
-        if self.duration:
-            self.set_zoom(max(1, min(100, self.zoom*(1.3 if event.angleDelta().y()>0 else 1/1.3))))
+        delta = event.angleDelta().y()
+        if self.duration and delta:
+            zoom = self.zoom*(1.3 if delta > 0 else 1/1.3)
+            self.set_zoom(max(1, min(100, zoom)), anchor_x=event.position().x())
 
     def set_view_start(self, value):
         self.view_start = max(0, min(self.duration-self.visible, value))

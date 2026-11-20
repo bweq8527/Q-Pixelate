@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from PySide6.QtCore import Qt, QPoint, QPointF, QMimeData
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from media_helpers import fixture
@@ -234,6 +234,32 @@ class EditorUpgradeTests(unittest.TestCase):
         self.assertEqual(w.timeline.selection, selected)
         w.zoom.setValue(1)
         self.assertFalse(w.scrollbar.isEnabled())
+
+    def test_wheel_zoom_keeps_time_under_pointer_in_panned_view(self):
+        w = self.window([Edit(2, 3)])
+        w.player.pause()
+        w.position_changed(500)
+        t = w.timeline
+        t.resize(640, 120)
+        w.zoom.setValue(4)
+        w.scrollbar.setValue(6000)
+        pointer = QPointF(420, 76)
+        anchor = t.time_at(pointer.x())
+        selected = t.selection
+        seeks = []
+        t.seekRequested.connect(seeks.append)
+        for delta in (120, -120):
+            before = t.visible
+            event = QWheelEvent(pointer, QPointF(t.mapToGlobal(pointer.toPoint())),
+                                QPoint(), QPoint(0, delta), Qt.NoButton, Qt.NoModifier,
+                                Qt.ScrollPhase.NoScrollPhase, False)
+            QApplication.sendEvent(t, event)
+            self.assertAlmostEqual(t.visible, before/1.3 if delta > 0 else before*1.3)
+            self.assertAlmostEqual(t.time_at(pointer.x()), anchor)
+            self.assertGreater(w.scrollbar.value(), 0)
+        self.assertEqual(t.position, .5)
+        self.assertEqual(t.selection, selected)
+        self.assertEqual(seeks, [])
 
     def test_space_over_focused_button_does_not_apply_or_resize(self):
         w = self.window()
