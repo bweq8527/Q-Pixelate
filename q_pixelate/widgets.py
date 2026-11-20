@@ -63,6 +63,7 @@ class VideoCanvas(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.image = QImage()
+        self.frame_time = None
         self.dimensions = (1920, 1080)
         self.auto_dimensions = False
         self.rect = Rect()
@@ -98,6 +99,8 @@ class VideoCanvas(QWidget):
         image = frame.toImage()
         if not image.isNull():
             self.image = image
+            timestamp = frame.startTime()
+            self.frame_time = timestamp / 1_000_000 if timestamp >= 0 else None
             if self.auto_dimensions:
                 self.dimensions = image.width(), image.height()
             self.update()
@@ -152,7 +155,8 @@ class VideoCanvas(QWidget):
             if layer.kind == 'sticker':
                 if layer.image not in self.sticker_images:
                     self.sticker_images[layer.image] = QImage(layer.image)
-                paint_sticker(painter, layer, self.sticker_images[layer.image], box)
+                displayed = layer.sticker_at(self.layer_source_time-layer.start) if layer.motion else layer
+                paint_sticker(painter, displayed, self.sticker_images[layer.image], box)
             elif layer.kind == 'mosaic':
                 rect = layer.mosaic_rect_at(self.layer_source_time-layer.start)
                 self.paint_detection_box(painter, box, rect)
@@ -264,7 +268,8 @@ class VideoCanvas(QWidget):
             return False
         for index, layer in reversed(self.layers):
             if layer.kind == 'sticker':
-                matrix, local = transform_geometry(layer.transform, box)
+                displayed = layer.sticker_at(self.layer_source_time-layer.start) if layer.motion else layer
+                matrix, local = transform_geometry(displayed.transform, box)
                 inside = local.contains(matrix.inverted()[0].map(position))
             elif layer.kind == 'mosaic':
                 inside = mask_path('rect', layer.mosaic_rect_at(self.layer_source_time-layer.start), [], box).contains(position)

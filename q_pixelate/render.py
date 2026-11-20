@@ -13,7 +13,7 @@ from pathlib import Path
 from .media import index_video, probe
 from .model import Project, plan_ranges, frame_bounds, legacy_image_box
 from .process import Runner
-from .masks import mask_image, raster_layer
+from .masks import mask_image, raster_layer, sticker_frames
 from .mosaic import mask_frames
 
 
@@ -99,14 +99,16 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
         ('mosaic', pair[0].strength) if pair[0].effect == 'mosaic' else object()))]
     rate = Fraction(fps).limit_denominator(1_000_000)
     frame_pts = f'settb={rate.denominator}/{rate.numerator},setpts=N'
-    has_mosaic = any(edit.effect == 'mosaic' for edit, _ in effects)
-    if has_mosaic:
+    has_motion = any(layer is not None and layer.motion for _, layer in effects)
+    if has_motion:
         graph[0] = f'[0:v:0]{frame_pts}[v0]'
 
-    def add_input(asset):
+    def add_input(asset, *, loop=True):
         nonlocal image_index
         image_index += 1
-        inputs.extend(['-loop', '1', '-framerate', str(fps), '-i', str(asset)])
+        if loop:
+            inputs.extend(['-loop', '1', '-framerate', str(fps)])
+        inputs.extend(['-i', str(asset)])
         return image_index
 
     def add_mask(i, edit, layer, pixel_format):
@@ -138,10 +140,9 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
             runner.run(FFMPEG + ['-f', 'rawvideo', '-pixel_format', 'gray',
                                  '-video_size', f'{width}x{height}', '-framerate', str(rate),
                                  '-i', 'pipe:0', '-c:v', 'ffv1', '-f', 'nut', str(asset)], input_chunks=chunks)
-            image_index += 1
-            inputs.extend(['-i', str(asset)])
+            index = add_input(asset, loop=False)
             block = edit.strength
-            graph.extend([f'[{image_index}:v]{frame_pts},format=gbrp[coverage{i}]',
+            graph.extend([f'[{index}:v]{frame_pts},format=gbrp[coverage{i}]',
                           f'[{before}]format=gbrp,split[base{i}][pixels{i}]',
                           f'[pixels{i}]scale={max(1, math.ceil(width/block))}:{max(1, math.ceil(height/block))}:flags=area,'
                           f'scale={width}:{height}:flags=neighbor,setsar={Fraction(pixel_aspect).limit_denominator()}[blocks{i}]',
@@ -153,6 +154,24 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
             graph.extend([f'[{before}]format=gbrp,split[base{i}][crop{i}]',
                           f'[crop{i}]boxblur={radius}:2[blur{i}]'])
             graph.append(f"[base{i}][blur{i}][{mask}]maskedmerge=enable='{enable}'[{after}]")
+        elif edit.effect == 'image' and layer is not None and layer.motion:
+            if stop is None or runner is None:
+                raise ValueError('跟随贴纸渲染需要明确的帧范围。')
+            active_first, active_last = max(first, offset_frame), min(last, round(stop*fps))
+            if active_first >= active_last:
+                graph.append(f'[{before}]null[{after}]')
+                continue
+            asset = workspace / f'tracked-{i}.nut'
+            # The effect interval may start later than the layer if the selection was trimmed.
+            origin = edit.start + min(0, layer.start)
+            chunks = sticker_frames(layer, width, height, pixel_aspect, active_first, active_last, fps, origin)
+            runner.run(FFMPEG + ['-f', 'rawvideo', '-pixel_format', 'rgba',
+                                 '-video_size', f'{width}x{height}', '-framerate', str(rate),
+                                 '-i', 'pipe:0', '-c:v', 'ffv1', '-pix_fmt', 'bgra', '-f', 'nut', str(asset)],
+                       input_chunks=chunks)
+            index = add_input(asset, loop=False)
+            graph.extend([f'[{index}:v]{frame_pts}+{active_first-offset_frame},format=rgba[image{i}]',
+                          f"[{before}][image{i}]overlay=0:0:enable='{enable}':eof_action=pass:repeatlast=0[{after}]"])
         elif edit.effect == 'image' and layer is not None:
             asset = workspace / f'layer-{i}.png'
             if not raster_layer(layer, width, height, pixel_aspect).save(str(asset)):
@@ -179,9 +198,9 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
             graph.append(f'[{before}]null[{after}]')
     last = f'v{len(groups)}'
     if speed != 1:
-        # Mosaic synchronizes the source and mask on whole-frame ticks. Resolve
+        # Motion effects synchronize their inputs on whole-frame ticks. Resolve
         # fractional frame positions before changing the video speed.
-        time_base = 'settb=AVTB,' if has_mosaic else ''
+        time_base = 'settb=AVTB,' if has_motion else ''
         graph.append(f'[{last}]{time_base}setpts=(PTS-STARTPTS)/{speed:.12f},fps={fps}[retimed]')
         last = 'retimed'
     if scale:

@@ -5,8 +5,8 @@
 先构建便携发行目录，再使用 Inno Setup 6.3 或更高版本的 `ISCC.exe` 构建 `Q-Pixelate-Setup.exe`。下面的命令用旧版发行清单复用 FFmpeg 和识别组件，只构建新的基础包和启动器。
 
 ```powershell
-python scripts/build_portable.py --offline --components base --reuse-catalog dist/portable/component-catalog.json --output dist/windows-0.2.0
-python scripts/build_installer.py --portable dist/windows-0.2.0 --iscc build/inno-tool/compiler/ISCC.exe
+python scripts/build_portable.py --offline --components base --reuse-catalog dist/windows-0.3.0/component-catalog.json --output dist/windows-0.3.0-rebuild
+python scripts/build_installer.py --portable dist/windows-0.3.0-rebuild --iscc build/inno-tool/compiler/ISCC.exe
 ```
 
 安装包默认生成在 `--portable` 指定的发行目录。把配套 ZIP 与安装包放在一起即可离线安装。安装向导可分别指定程序和组件位置，安装后可在「设置 → 环境与组件」更改。默认程序目录是 `%LOCALAPPDATA%\Programs\Q-Pixelate`，组件目录是 `%LOCALAPPDATA%\Q-Pixelate\components`。卸载默认保留组件和用户文件。

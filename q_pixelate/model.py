@@ -6,7 +6,7 @@ import math
 import os
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 
@@ -79,24 +79,37 @@ class Layer:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     motion: list[tuple[float, Rect]] = field(default_factory=list)
 
+    def _motion_rect_at(self, elapsed):
+        index = bisect.bisect_right(self.motion, elapsed, key=lambda point: point[0])
+        if index == 0:
+            return self.motion[0][1]
+        if index == len(self.motion):
+            return self.motion[-1][1]
+        a, first = self.motion[index-1]
+        b, second = self.motion[index]
+        t = (elapsed-a)/(b-a)
+        return Rect(first.x+(second.x-first.x)*t, first.y+(second.y-first.y)*t,
+                    first.w+(second.w-first.w)*t, first.h+(second.h-first.h)*t)
+
     def mosaic_rect_at(self, elapsed):
         """Interpolate source boxes, then apply the user's edit to the whole track."""
-        index = bisect.bisect_right(self.motion, elapsed, key=lambda point: point[0])
-        reference = self.motion[0][1]
-        if index == 0:
-            box = reference
-        elif index == len(self.motion):
-            box = self.motion[-1][1]
-        else:
-            a, first = self.motion[index-1]
-            b, second = self.motion[index]
-            t = (elapsed-a)/(b-a)
-            box = Rect(first.x+(second.x-first.x)*t, first.y+(second.y-first.y)*t,
-                       first.w+(second.w-first.w)*t, first.h+(second.h-first.h)*t)
+        reference, box = self.motion[0][1], self._motion_rect_at(elapsed)
         transform = self.transform
         sx, sy = transform.w/reference.w, transform.h/reference.h
         return Rect(transform.x-transform.w/2+(box.x-reference.x)*sx,
                     transform.y-transform.h/2+(box.y-reference.y)*sy, box.w*sx, box.h*sy)
+
+    def sticker_at(self, elapsed):
+        """Resolve the sticker's position and size relative to the tracked target."""
+        if not self.motion:
+            return self
+        reference = Transform.from_rect(self.motion[0][1])
+        target = Transform.from_rect(self._motion_rect_at(elapsed))
+        transform = self.transform
+        sx, sy = target.w/reference.w, target.h/reference.h
+        return replace(self, motion=[], transform=Transform(
+            target.x+(transform.x-reference.x)*sx, target.y+(transform.y-reference.y)*sy,
+            transform.w*sx, transform.h*sy, transform.angle))
 
     def validate(self):
         if (any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in (self.start, self.end))
@@ -114,14 +127,18 @@ class Layer:
         if self.kind == 'mosaic':
             if not self.motion or self.mask or self.image or self.transform.angle:
                 raise ValueError('马赛克图层需要矩形轨迹。')
+        elif self.motion:
+            if self.kind != 'sticker':
+                raise ValueError('仅贴纸和马赛克图层支持矩形轨迹。')
+            if self.mask is not None:
+                raise ValueError('跟随贴纸不能添加遮罩。')
+        if self.motion:
             previous = -math.inf
             for timestamp, box in self.motion:
                 if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp) or timestamp <= previous:
-                    raise ValueError('马赛克轨迹时间无效。')
+                    raise ValueError('轨迹时间无效。')
                 box.validate()
                 previous = timestamp
-        elif self.motion:
-            raise ValueError('仅马赛克图层支持自动遮挡轨迹。')
 
 
 @dataclass
@@ -263,7 +280,8 @@ class Project:
                     if not layer['motion']:
                         layer.pop('motion')
             edits.append(raw)
-        version = (4 if any(layer.kind == 'mosaic' for e in self.edits for layer in e.layers or [])
+        version = (5 if any(layer.kind == 'sticker' and layer.motion for e in self.edits for layer in e.layers or [])
+                   else 4 if any(layer.kind == 'mosaic' for e in self.edits for layer in e.layers or [])
                    else 3 if any(e.layers is not None for e in self.edits) else 2)
         data = {'version': version, 'source': relative(self.source),
                 'fingerprint': self.fingerprint, 'edits': edits}
@@ -283,7 +301,7 @@ class Project:
         path = Path(path).resolve()
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
-            if not isinstance(data, dict) or data.get('version') not in (1, 2, 3, 4):
+            if not isinstance(data, dict) or data.get('version') not in (1, 2, 3, 4, 5):
                 raise ValueError('工程格式或版本不受支持。')
             def absolute(value):
                 if not isinstance(value, str):

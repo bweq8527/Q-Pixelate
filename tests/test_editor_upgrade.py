@@ -5,13 +5,14 @@ import unittest
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 from PySide6.QtCore import Qt, QPoint, QPointF, QMimeData
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from media_helpers import fixture
 from q_pixelate.app import MainWindow
-from q_pixelate.model import Project, Edit, Layer, Rect, Transform
+from q_pixelate.model import Project, Edit, Layer, Mask, Rect, Transform
 from q_pixelate.masks import transform_geometry
 from q_pixelate.media import probe
 from q_pixelate.process import Runner
@@ -20,6 +21,35 @@ from q_pixelate.stickers import STICKER_MIME, StickerLibrary
 
 
 class EditorUpgradeTests(unittest.TestCase):
+    def test_tracking_draw_starts_at_displayed_frame_and_creates_sticker_until_loss(self):
+        w = self.window([Edit(1, 3, 'none', layers=[])])
+        asset = Path(self.temp.name) / 'tracking-target.png'
+        image = QImage(16, 16, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.red)
+        self.assertTrue(image.save(str(asset)))
+        w.sticker_library_list.add_asset(str(asset), '跟随贴纸')
+        w.sticker_library_list.setCurrentRow(w.sticker_library_list.count()-1)
+        w.canvas.frame_time = 1.25
+        w.tracking_runtime = lambda: ('python.exe', Path(self.temp.name))
+        w.start_job = Mock()
+        w.layer_panel.track.click()
+        self.assertEqual(w.canvas.mask_shape, 'rect')
+        first, second = Rect(.1, .15, .2, .2), Rect(.4, .25, .2, .2)
+        w.finish_mask(Mask('rect', Transform.from_rect(first)))
+        w.start_job.assert_called_once()
+        done = w.start_job.call_args.args[1]
+        done(SimpleNamespace(points=[(1.25, first), (1.50, second)], end=1.55, reason='目标丢失'))
+        layer, = w.layer_edit().layers
+        self.assertEqual((layer.kind, layer.start, layer.end, layer.image), ('sticker', .25, .55, str(asset)))
+        self.assertEqual(layer.motion, [(0, first), (.25, second)])
+        w.update_canvas_mask(1.5)
+        self.assertEqual(w.canvas.layers, [(0, layer)])
+        w.update_canvas_mask(1.55)
+        self.assertEqual(w.canvas.layers, [])
+        w.seek = Mock()
+        w.layer_panel.track_end.click()
+        w.seek.assert_called_once_with(1.55)
+
     def test_review_detection_marks_and_applies_once(self):
         w = self.window([Edit(1, 2, 'none', layers=[]), Edit(3, 4, 'none', layers=[])])
         w.editor_tabs.setCurrentWidget(w.detection_tab)

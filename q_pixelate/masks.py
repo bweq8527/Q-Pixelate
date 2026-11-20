@@ -30,7 +30,7 @@ def paint_sticker(painter, layer, image, box, pixel_aspect=1, clip=True):
     painter.restore()
 
 
-def raster_layer(layer, width, height, pixel_aspect=1, *, mask=False):
+def raster_layer(layer, width, height, pixel_aspect=1, *, mask=False, asset=None):
     image = QImage(width, height, QImage.Format.Format_RGB32 if mask else QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(Qt.GlobalColor.black if mask else Qt.GlobalColor.transparent)
     painter = QPainter(image)
@@ -41,13 +41,26 @@ def raster_layer(layer, width, height, pixel_aspect=1, *, mask=False):
         if mask:
             painter.fillPath(layer_mask_path(layer.mask, box, pixel_aspect), Qt.GlobalColor.white)
         else:
-            asset = QImage(layer.image)
+            if asset is None:
+                asset = QImage(layer.image)
             if asset.isNull():
                 raise ValueError('无法读取贴纸图片。')
             paint_sticker(painter, layer, asset, box, pixel_aspect, clip=False)
     finally:
         painter.end()
     return image
+
+
+def sticker_frames(layer, width, height, pixel_aspect, first, last, fps, origin):
+    asset = QImage(layer.image)
+    if asset.isNull():
+        raise ValueError('无法读取贴纸图片。')
+    for frame in range(first, last):
+        sticker = layer.sticker_at(frame/fps - origin)
+        image = raster_layer(sticker, width, height, pixel_aspect, asset=asset)
+        # Raw overlay pixels carry straight alpha.
+        image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        yield image.constBits()
 
 
 def mask_path(shape, rect, points, box):

@@ -111,6 +111,7 @@ var
   OldProgram, OldComponent, OldArchives, OldInstaller, OldUninstaller: String;
   NewProgram, NewComponent, NewArchives, NewInstaller, PendingLayout: String;
   Relocating, LayoutReplaced, InstallCommitted, CacheCreated, InstallNeedsCache: Boolean;
+  ComponentsRemoved: Boolean;
 
 function MoveFileEx(const ExistingName, NewName: String; Flags: Cardinal): Boolean;
   external 'MoveFileExW@kernel32.dll stdcall';
@@ -141,6 +142,11 @@ end;
 function CacheDirectory: String;
 begin
   Result := AddBackslash(StateDirectory) + 'installers';
+end;
+
+function ComponentHintPath: String;
+begin
+  Result := AddBackslash(StateDirectory) + 'last-component-directory.txt';
 end;
 
 function InstallerCacheDir(Param: String): String;
@@ -297,6 +303,8 @@ begin
 end;
 
 procedure InitializeWizard;
+var
+  SavedDirectory: AnsiString;
 begin
   ComponentPage := CreateInputDirPage(wpSelectDir, CustomMessage('ComponentTitle'),
     CustomMessage('ComponentDescription'), CustomMessage('ComponentPrompt'), False, '');
@@ -305,6 +313,9 @@ begin
     ComponentPage.Values[0] := OldComponent
   else
     ComponentPage.Values[0] := ExpandConstant('{param:componentdir|}');
+  if (ComponentPage.Values[0] = '') and LoadStringFromFile(ComponentHintPath, SavedDirectory) then
+    if IsAbsoluteDirectory(UTF8Decode(SavedDirectory)) then
+      ComponentPage.Values[0] := UTF8Decode(SavedDirectory);
   if ComponentPage.Values[0] = '' then
     ComponentPage.Values[0] := AddBackslash(StateDirectory) + 'components';
 end;
@@ -545,14 +556,22 @@ begin
         (not UninstallSilent and
           (SuppressibleMsgBox(CustomMessage('RemoveComponents'), mbConfirmation,
            MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES)) then
+      begin
         if not Exec(AddBackslash(ProgramDirectory) + 'Q-Pixelate.exe', '--remove-installed-components',
           ProgramDirectory, SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
         begin
           SuppressibleMsgBox(CustomMessage('ComponentRemovalError'), mbError, MB_OK, IDOK);
           Abort;
         end;
+        ComponentsRemoved := True;
+      end;
     usPostUninstall:
       begin
+        if ComponentsRemoved then
+          DeleteFile(ComponentHintPath)
+        else
+          if not SaveStringToFile(ComponentHintPath, UTF8Encode(ReadLayoutField(Layout, 'component_dir')), False) then
+            Log('Could not save the previously selected component location.');
         RemoveCachedInstaller(ReadLayoutField(Layout, 'installer'));
         RemoveDir(CacheDirectory);
         DeleteFile(LayoutPath);

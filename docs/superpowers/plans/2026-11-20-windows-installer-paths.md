@@ -2,11 +2,11 @@
 
 方案见 `../specs/2026-11-20-windows-installer-paths-design.md`。已获用户确认。直接复用当前检出和 `dist/portable` 中上一轮生成的组件输入，避免重建大型 GPU 包。任何新安装及卸载验证仅使用隔离的测试目录和测试配置。
 
-- [ ] 分离程序目录、组件目录、离线包来源和每用户设置。在切换组件目录前验证复制结果，并测试中断时继续使用旧目录。
+- [x] 分离程序目录、组件目录、离线包来源和每用户设置。在切换组件目录前验证复制结果，并测试中断时继续使用旧目录。
 - [x] 在编辑器设置显示和更改路径。将需退出编辑器的操作交接给独立启动器，由启动器等待当前进程退出。
-- [ ] 增加 Inno Setup 构建入口和每用户安装、维护、卸载流程。更新快捷方式和卸载记录，保留用户文件。
-- [ ] 刷新便携启动器和基础包，保留现有其它组件，生成安装 EXE。
-- [ ] 运行完整回归和隔离安装测试，记录成品、测试结果、可复现命令与未完成项。
+- [x] 增加 Inno Setup 构建入口和每用户安装、维护、卸载流程。更新快捷方式和卸载记录，保留用户文件。
+- [x] 刷新便携启动器和基础包，保留现有其它组件，生成安装 EXE。
+- [x] 运行回归和隔离安装测试，记录成品、测试结果、可复现命令与未完成项。
 
 接口约定：安装版路径配置为 `%LOCALAPPDATA%\Q-Pixelate\installation.json`，键为 `program_dir`、`component_dir`、`archive_dir`、`installer`。只在 `program_dir` 匹配当前启动器目录时应用此配置。编辑器与启动器通过同一组件管理器读取状态，便携版配置仍独立于安装版。安装程序及源码管理模块互不依赖 Qt。
 
@@ -21,4 +21,6 @@ python -X utf8 -m unittest discover -s tests -v
 python -m compileall -q q_pixelate launcher.py scripts
 ```
 
-阶段验证：`test_launcher_locations.py` 4 项通过，`test_release_reuse.py` 1 项通过。Inno Setup 编译器已放入 `build/inno-tool/compiler`。安装包编译和带组件的隔离安装待完成后记录。
+交付于 2026-11-21。安装包为 `dist/windows-0.2.0/Q-Pixelate-Setup.exe`，同目录包含便携启动器和全部配套 ZIP。旧目录 `dist/portable` 保留。安装包使用 `build/inno-tool/compiler/ISCC.exe` 构建通过，六个组件包的清单大小和 SHA-256 均已校验。
+
+验证记录：阶段全量回归通过 101 项。最终定向回归通过 11 项路径测试和 5 项启动器测试。真实 FFmpeg 与 320n 组件通过 D 盘迁到 C 盘的验证。隔离 Windows 安装测试使用含中文和空格的自选程序及组件目录，检查首次安装登记、程序迁移后卸载记录更新、旧目录用户文件保留，以及卸载默认保留组件和记住其路径。测试脚本位于本机 `.test-artifacts/installer-lifecycle-smoke.py`，会使用唯一的临时安装项并自动卸载，执行时需要可写当前用户的开始菜单和卸载注册表。还未在全新 Windows 虚拟机验收。

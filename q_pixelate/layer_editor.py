@@ -7,15 +7,18 @@ from PySide6.QtCore import QSignalBlocker
 from PySide6.QtGui import QImage
 
 from .model import Layer, Transform, frame_bounds
+from .sticker_tracking import StickerTracking
 
 
-class LayerEditing:
+class LayerEditing(StickerTracking):
     def connect_layer_editor(self):
         panel = self.layer_panel
         panel.picker.currentIndexChanged.connect(self.select_layer)
         panel.draw.clicked.connect(lambda: self.begin_mask(False))
         panel.redraw.clicked.connect(lambda: self.begin_mask(True))
         panel.full_blur.clicked.connect(self.add_full_blur)
+        panel.track.clicked.connect(self.begin_sticker_tracking)
+        panel.track_end.clicked.connect(self.review_tracking_end)
         panel.raise_.clicked.connect(lambda: self.reorder_layer(1))
         panel.lower.clicked.connect(lambda: self.reorder_layer(-1))
         panel.delete.clicked.connect(self.delete_layer)
@@ -70,12 +73,14 @@ class LayerEditing:
         panel.draw.setEnabled(editable)
         panel.shape.setEnabled(editable)
         panel.full_blur.setEnabled(editable)
+        panel.track.setEnabled(editable)
+        panel.track_end.setEnabled(bool(layer and layer.kind == 'sticker' and layer.motion))
         panel.lower.setEnabled(editable and selected > 0)
         panel.raise_.setEnabled(editable and 0 <= selected < len(edit.layers)-1)
         panel.delete.setEnabled(editable and layer is not None)
         panel.details.setVisible(layer is not None)
         panel.details.setEnabled(editable)
-        panel.redraw.setEnabled(editable and bool(layer) and layer.kind != 'mosaic')
+        panel.redraw.setEnabled(editable and bool(layer) and not layer.motion)
         if not layer:
             return
         panel.name.setText(layer.name)
@@ -102,7 +107,7 @@ class LayerEditing:
         panel.feather.setEnabled(layer.mask is not None)
         panel.feather.setValue(layer.mask.feather if layer.mask else 0)
         transform = self.target_transform(layer)
-        panel.transform.setEnabled(transform is not None and not mosaic)
+        panel.transform.setEnabled(transform is not None and not layer.motion)
         for spin in panel.geometry:
             spin.setEnabled(transform is not None and (not mosaic or spin is not panel.geometry[-1]))
         if transform:
@@ -125,6 +130,7 @@ class LayerEditing:
         self.canvas.free_transform = False
         self.canvas.layer_gesture = None
         self._mask_context = None
+        self._tracking_request = None
         self.canvas.mask_shape = None
         self.canvas.mask_stroke = []
 
@@ -228,7 +234,8 @@ class LayerEditing:
 
     def begin_mask(self, redraw):
         edit = self.layer_edit()
-        if not edit or edit.locked:
+        layer = self.selected_layer(edit) if redraw else None
+        if not edit or edit.locked or (layer and layer.motion):
             return
         self.player.pause()
         self.cancel_layer_interaction()
@@ -239,6 +246,9 @@ class LayerEditing:
         self.update_canvas_mask()
 
     def finish_mask(self, mask):
+        if self._tracking_request:
+            self.finish_sticker_tracking(mask)
+            return
         context, self._mask_context = self._mask_context, None
         edit = self.layer_edit()
         if not context or not edit or edit.locked or context[0] != self._editing_row:
@@ -273,7 +283,7 @@ class LayerEditing:
     def set_layer_kind(self, _):
         edit = self.layer_edit()
         layer = self.selected_layer(edit)
-        if not layer or edit.locked or layer.kind == 'mosaic':
+        if not layer or edit.locked or layer.motion:
             return
         kind = self.layer_panel.kind.currentData()
         if kind == layer.kind or kind == 'mosaic':
@@ -309,7 +319,7 @@ class LayerEditing:
         edit = self.layer_edit()
         layer = self.selected_layer(edit)
         transform = self.target_transform(layer)
-        if not transform or edit.locked or layer.kind == 'mosaic':
+        if not transform or edit.locked or layer.motion:
             return False
         if self.canvas.free_transform:
             self.canvas.setFocus()
@@ -358,6 +368,11 @@ class LayerEditing:
             return
         layer = edit.layers[index]
         start, end = max(edit.start, start), min(end, edit.end)
+        tracked_sticker = layer.kind == 'sticker' and bool(layer.motion)
+        if tracked_sticker:
+            origin = edit.start + layer.start
+            start = max(start, origin + layer.motion[0][0])
+            end = min(end, origin + layer.motion[-1][0] + 1/self.info.fps_float)
         # Time controls display millisecond precision. Preserve sub-ms source
         # boundaries if the user merely focuses and leaves an unchanged field.
         a, b = edit.layer_span(layer)
@@ -370,7 +385,7 @@ class LayerEditing:
         self.select_layer(index)
         new_start = start-edit.start
         updates = {'start': new_start, 'end': end-edit.start}
-        if layer.motion and abs((end-start)-(layer.end-layer.start)) > .0005:
+        if tracked_sticker or (layer.motion and abs((end-start)-(layer.end-layer.start)) > .0005):
             updates['motion'] = [(time+layer.start-new_start, box) for time, box in layer.motion]
         self.update_layer(**updates)
 

@@ -146,6 +146,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self._layer_target = 'sticker'
         self._transform_before = None
         self._mask_context = None
+        self._tracking_request = None
         self._loading_form = False
         self._range_locked = False
         self.mask_points = []
@@ -312,6 +313,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         library_layout.addWidget(self.image_button)
         library_layout.addWidget(label('从这里拖到视频画面。'))
         library_layout.addWidget(self.sticker_library_list, 1)
+        library_layout.addWidget(button('用选中贴纸框选并追踪', self.begin_sticker_tracking))
         self.layer_panel = LayerInspector()
         self.layer_tab = QWidget()
         self.layer_tab.setObjectName('layerProperties')
@@ -549,6 +551,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.project_path = None
         self.player.stop()
         self.canvas.image = self.canvas.image.__class__()
+        self.canvas.frame_time = None
         sar = info.video.get('sample_aspect_ratio', '1:1')
         try:
             numerator, denominator = map(int, sar.split(':'))
@@ -1068,6 +1071,8 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
 
     def on_frame(self, frame):
         self.canvas.set_frame(frame)
+        if self.project and frame.isValid() and self.canvas.frame_time is not None:
+            self.update_canvas_mask(self.canvas.frame_time)
         if self._pause_on_frame and frame.isValid():
             self._pause_on_frame = False
             self.player.pause()
@@ -1122,7 +1127,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         if 0 < abs(frame_time-seconds) < .00051:
             active_row = next((i for i, edit in enumerate(self.timeline.edits)
                                if edit.start <= frame_time < edit.end and edit.layers and
-                               any(layer.kind == 'mosaic' for layer in edit.layers)), active_row)
+                               any(layer.motion for layer in edit.layers)), active_row)
         active = self.timeline.edits[active_row] if self.project and active_row >= 0 else None
         self._canvas_layer_row = active_row
         self.canvas.layers = []
@@ -1132,12 +1137,12 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             self.canvas.layer_source_time = frame_time-active.start
             self.canvas.layers = [(i, layer) for i, layer in enumerate(active.layers)
                                   if (span := active.layer_span(layer))[0] <= (
-                                      frame_time if layer.kind == 'mosaic' else seconds) < span[1]]
+                                      frame_time if layer.motion else seconds) < span[1]]
         if selected:
             if not playing and not selected.locked:
                 layer = self.selected_layer(selected)
                 transform = self.target_transform(layer)
-                if transform and layer.kind != 'mosaic':
+                if transform and not layer.motion:
                     mask = layer.mask if self._layer_target == 'mask' else None
                     self.canvas.layer_target = transform, mask
             self.canvas.show_mask = False
