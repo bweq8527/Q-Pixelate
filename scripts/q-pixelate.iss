@@ -14,6 +14,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 DefaultDirName={code:DefaultProgramDirectory}
 UsePreviousAppDir=no
+UninstallLogMode=append
 DisableDirPage=no
 DefaultGroupName={#ProductName}
 DisableProgramGroupPage=yes
@@ -82,6 +83,10 @@ en.RemoveComponents=Remove Q-Pixelate components installed by the launcher? Choo
 zh.RemoveComponents=是否清理启动器安装的 Q-Pixelate 组件？选择「否」可保留组件供以后使用。个人文件和离线 ZIP 会保留。
 en.ComponentRemovalError=Q-Pixelate could not finish removing its components. Uninstall has been stopped so you can retry.
 zh.ComponentRemovalError=Q-Pixelate 未能完成组件清理。卸载已停止，可以重试。
+en.RemoveProcessFiles=Remove Q-Pixelate process files from current and previously used locations? Choose No to keep them.
+zh.RemoveProcessFiles=是否清理 Q-Pixelate 在当前及曾用目录中生成的过程文件？选择「否」可保留这些文件。
+en.ProcessRemovalError=Q-Pixelate could not finish removing its process files. Close any open Q-Pixelate windows and retry uninstall.
+zh.ProcessRemovalError=Q-Pixelate 未能完成过程文件清理。请关闭已打开的 Q-Pixelate 窗口后重试卸载。
 en.LaunchProgram=Launch Q-Pixelate
 zh.LaunchProgram=启动 Q-Pixelate
 
@@ -283,6 +288,12 @@ begin
       SuppressibleMsgBox(CustomMessage('LayoutError'), mbError, MB_OK, IDOK);
       Exit;
     end;
+  end
+  else
+  begin
+    OldProgram := ReadUninstallValue('Inno Setup: App Path');
+    if not IsAbsoluteDirectory(OldProgram) or not FileExists(AddBackslash(OldProgram) + 'Q-Pixelate.exe') then
+      OldProgram := '';
   end;
   if Relocating and ((OldProgram = '') or
       not FileExists(AddBackslash(OldProgram) + 'Q-Pixelate.exe')) then
@@ -552,6 +563,17 @@ begin
     Exit;
   case CurUninstallStep of
     usUninstall:
+    begin
+      if (ExpandConstant('{param:removeprocessfiles|0}') = '1') or
+        (not UninstallSilent and
+          (SuppressibleMsgBox(CustomMessage('RemoveProcessFiles'), mbConfirmation,
+           MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES)) then
+        if not Exec(AddBackslash(ProgramDirectory) + 'Q-Pixelate.exe', '--remove-process-files',
+          ProgramDirectory, SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+        begin
+          SuppressibleMsgBox(CustomMessage('ProcessRemovalError'), mbError, MB_OK, IDOK);
+          Abort;
+        end;
       if (ExpandConstant('{param:removecomponents|0}') = '1') or
         (not UninstallSilent and
           (SuppressibleMsgBox(CustomMessage('RemoveComponents'), mbConfirmation,
@@ -565,6 +587,7 @@ begin
         end;
         ComponentsRemoved := True;
       end;
+    end;
     usPostUninstall:
       begin
         if ComponentsRemoved then

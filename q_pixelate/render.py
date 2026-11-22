@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
 import shutil
 import tempfile
+from bisect import bisect_right
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from itertools import groupby
 from pathlib import Path
 
 from .media import index_video, probe
-from .model import Project, plan_ranges, frame_bounds, legacy_image_box
+from .model import Edit, Project, plan_ranges, frame_bounds, legacy_image_box
 from .process import Runner
 from .masks import mask_image, raster_layer, sticker_frames
 from .mosaic import mask_frames
@@ -27,6 +29,19 @@ class ExportReport:
     copied_seconds: float
     frames: int
     audio_tracks: int
+
+
+@dataclass(frozen=True)
+class PreviewSpan:
+    kind: str
+    start_ms: int
+    end_ms: int
+
+
+@dataclass(frozen=True)
+class PreviewReport:
+    path: str
+    spans: tuple[PreviewSpan, ...]
 
 
 def require_idr(info, frame, runner):
@@ -90,7 +105,7 @@ def sample_aspect(info):
 
 
 def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed=1,
-                 *, stop=None, pixel_aspect=1, runner=None):
+                 *, stop=None, pixel_aspect=1, runner=None, transitions=()):
     """Stage assets under safe names; user paths never appear inside filter syntax."""
     inputs = []
     image_index = 0
@@ -213,6 +228,11 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
         time_base = 'settb=AVTB,' if has_motion else ''
         graph.append(f'[{last}]{time_base}setpts=(PTS-STARTPTS)/{speed:.12f},fps={fps}[retimed]')
         last = 'retimed'
+    if transitions:
+        fades = video_transition_filters(transitions, offset_frame, stop_frame, speed)
+        if fades:
+            graph.append(f'[{last}]{",".join(fades)}[faded]')
+            last = 'faded'
     if scale:
         graph.append(f"[{last}]scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,scale=w='min({scale},iw)':h=-2[out]")
     else:
@@ -240,6 +260,113 @@ def output_frames(start, end, speed):
     return max(1, round((end-start)/speed))
 
 
+def _preview_report(destination, edits, start, end, sections, fps, fades=()):
+    # Use the actual rendered frame count of each run, including any speed rounding.
+    positions = []
+    output = 0
+    for first, last, speed in sections:
+        count = output_frames(first, last, speed)
+        positions.append((first, last, output, count))
+        output += count
+
+    def output_ms(frame):
+        i = bisect_right(positions, frame, key=lambda position: position[0]) - 1
+        if i < 0:
+            return 0
+        first, last, offset, count = positions[i]
+        return round(1000 / fps * (offset + count * (min(last, frame) - first) / (last - first)))
+
+    spans = set()
+
+    def add_span(kind, first, last):
+        first, last = max(start, first), min(end, last)
+        if first < last:
+            left = output_ms(first)
+            spans.add(PreviewSpan(kind, left, left if kind == 'cut' else output_ms(last)))
+
+    for first, last, speed in sections:
+        if speed != 1:
+            add_span('speed', first, last)
+    for edit in edits:
+        if edit.omit:
+            add_span('cut', *frame_bounds(edit, fps))
+    for edit, _ in effect_intervals(edits):
+        if edit.effect != 'none':
+            kind = {'image': 'sticker', 'mosaic': 'mosaic'}.get(edit.effect, 'blur')
+            add_span(kind, *frame_bounds(edit, fps))
+    for fade in fades:
+        add_span('transition', fade.start, fade.end)
+    ordered = sorted(spans, key=lambda span: (span.start_ms, span.end_ms, span.kind))
+    return PreviewReport(str(destination), tuple(ordered))
+
+
+@dataclass(frozen=True)
+class TransitionWindow:
+    start: int
+    end: int
+    direction: str
+    style: str
+
+
+def transition_windows(edits, start, end, fps, channel):
+    """Locate fades on the retained source frames alongside each omission."""
+    incoming, outgoing = {}, {}
+    for edit in edits:
+        style = getattr(edit, f'{channel}_transition')
+        if edit.omit and style != 'cut':
+            first, last = frame_bounds(edit, fps)
+            if first < last:
+                outgoing[first] = incoming[last] = (style, edit.transition_duration)
+    if not incoming:
+        return []
+    windows = []
+    for first, last, speed in speed_sections(edits, start, end, fps):
+        head, tail = incoming.get(first), outgoing.get(last)
+        limit = max(1, (last-first)//2) if head and tail else last-first
+        if head:
+            count = min(limit, max(1, round(head[1]*fps*speed)))
+            windows.append(TransitionWindow(first, first+count, 'in', head[0]))
+        if tail:
+            count = min(limit, max(1, round(tail[1]*fps*speed)))
+            windows.append(TransitionWindow(last-count, last, 'out', tail[0]))
+    return windows
+
+
+def video_transition_filters(windows, first, last, speed):
+    filters = []
+    for window in windows:
+        if window.end <= first or window.start >= last:
+            continue
+        start = round((window.start-first)/speed)
+        end = max(start+1, round((window.end-first)/speed))
+        # Fade-out reaches the matte on the last surviving frame. A one-frame
+        # fade-out starts on a padded frame just before it.
+        origin = min(start, end-2) if window.direction == 'out' else start
+        padding = max(0, -origin)
+        if padding:
+            filters.append(f'tpad=start={padding}:start_mode=clone')
+        filters.append(f'fade=t={window.direction}:s={max(0, origin)}:'
+                       f'n={max(1, end-origin-1)}:c={window.style}')
+        if padding:
+            filters.extend((f'trim=start_frame={padding}', 'setpts=PTS-STARTPTS'))
+    return filters
+
+
+def audio_transition_filters(windows, first, last, source_frame_duration):
+    filters = []
+    for window in windows:
+        if window.end <= first or window.start >= last:
+            continue
+        delay = max(0, first-window.start)*source_frame_duration
+        if delay:
+            filters.append(f'asetpts=PTS+{delay:.12f}/TB')
+        filters.append(f'afade=t={window.direction}:st={max(0, window.start-first)*source_frame_duration:.12f}:'
+                       f'd={((window.end-window.start)*source_frame_duration):.12f}')
+        if delay:
+            filters.append('asetpts=PTS-STARTPTS')
+    return filters
+
+
 def tempo_chain(speed):
     factors = []
     while speed < .5:
@@ -251,7 +378,7 @@ def tempo_chain(speed):
     return ','.join(f'atempo={s:.12f}' for s in factors+[speed])
 
 
-def audio_graph(info, edits, start, end, input_index):
+def audio_graph(info, edits, start, end, input_index, transitions=()):
     sections = speed_sections(edits, start, end, info.fps_float)
     graph, maps = [], []
     for track in range(len(info.audio)):
@@ -265,18 +392,20 @@ def audio_graph(info, edits, start, end, input_index):
             duration = count/info.fps_float
             effective = (b-a)/count
             tempo = f',{tempo_chain(effective)}' if effective != 1 else ''
+            fades = audio_transition_filters(transitions, a, b, duration/(b-a))
+            fade_chain = ',' + ','.join(fades) if fades else ''
             graph.append(f'[a{track}s{i}]atrim=start={a/info.fps_float:.12f}:end={b/info.fps_float:.12f},'
-                         f'asetpts=PTS-STARTPTS{tempo},apad,atrim=duration={duration:.12f}[a{track}p{i}]')
+                         f'asetpts=PTS-STARTPTS{tempo},apad,atrim=duration={duration:.12f}{fade_chain}[a{track}p{i}]')
         graph.append(''.join(f'[a{track}p{i}]' for i in range(len(sections)))+
                      f'concat=n={len(sections)}:v=0:a=1[aout{track}]')
         maps += ['-map', f'[aout{track}]']
     return ';'.join(graph), maps
 
 
-def edited_audio_options(info, edits, start, end, input_index):
+def edited_audio_options(info, edits, start, end, input_index, transitions=()):
     if not info.audio:
         return []
-    graph, maps = audio_graph(info, edits, start, end, input_index)
+    graph, maps = audio_graph(info, edits, start, end, input_index, transitions)
     options = ['-filter_complex', graph] + maps + ['-c:a', 'aac', '-b:a', '192k']
     for track, metadata in enumerate(info.audio):
         for key, value in metadata.get('tags', {}).items():
@@ -313,6 +442,33 @@ def _encoder(info):
     return args
 
 
+def _publish_output(source, destination, runner, *, overwrite=True):
+    if not overwrite and destination.exists():
+        raise ValueError('输出文件已被其他程序创建，请选择新路径。')
+    try:
+        os.replace(source, destination)
+        return
+    except OSError as error:
+        if error.errno != errno.EXDEV and getattr(error, 'winerror', None) != 17:
+            raise
+
+    # Cross-volume moves need a sibling staging file to preserve atomic replacement.
+    size = source.stat().st_size
+    if shutil.disk_usage(destination.parent).free < size:
+        raise ValueError('输出磁盘剩余空间不足，无法保存成片。')
+    with tempfile.TemporaryDirectory(prefix='.qpixel-publish-', dir=destination.parent) as directory:
+        pending = Path(directory) / destination.name
+        runner.report(99, '正在将结果写入输出磁盘…')
+        with source.open('rb') as input_file, pending.open('xb') as output:
+            while chunk := input_file.read(1024 * 1024):
+                runner.check()
+                output.write(chunk)
+        runner.check()
+        if not overwrite and destination.exists():
+            raise ValueError('输出文件已被其他程序创建，请选择新路径。')
+        os.replace(pending, destination)
+
+
 class Exporter:
     def export(self, project: Project, destination, runner: Runner, overwrite=False) -> ExportReport:
         runner.check()
@@ -334,10 +490,9 @@ class Exporter:
         if (not retimed and destination.suffix.lower() == '.mp4'
                 and any(a.get('codec_name') not in ('aac', 'mp3', 'ac3', 'eac3', 'alac') for a in info.audio)):
             raise ValueError('MP4 不能直接保留该音轨编码，请选择 MKV 输出。')
-        if shutil.disk_usage(destination.parent).free < Path(project.source).stat().st_size * 2.2:
-            raise ValueError('输出磁盘空间不足；请预留至少约源视频 2.2 倍空间。')
-        with tempfile.TemporaryDirectory(prefix='.qpixel-', dir=destination.parent) as directory:
-            work = Path(directory)
+        with runner.workspace('.qpixel-', fallback=destination.parent) as work:
+            if shutil.disk_usage(work).free < Path(project.source).stat().st_size * 2.2:
+                raise ValueError('过程文件磁盘空间不足，请预留至少约源视频 2.2 倍空间。')
             pending = work / ('result' + destination.suffix)
             if not intervals:
                 runner.report(10, '没有修订片段，正在直接复制视频和音频…')
@@ -348,6 +503,11 @@ class Exporter:
                 copied = info.duration
             else:
                 index = index_video(info, runner)
+                video_fades = transition_windows(project.edits, 0, index.frames, info.fps_float, 'video')
+                audio_fades = (transition_windows(project.edits, 0, index.frames, info.fps_float, 'audio')
+                               if info.audio else [])
+                intervals.extend(Edit(fade.start/info.fps_float, fade.end/info.fps_float, 'none')
+                                 for fade in video_fades)
                 spans = plan_ranges(intervals, index.keyframes, index.frames, info.fps_float)
                 pieces = [(a, b, speed, span.encode) for span in spans
                           for a, b, speed in speed_sections(project.edits, span.start, span.end, info.fps_float)]
@@ -376,7 +536,8 @@ class Exporter:
                         edits = [e for e in project.edits if e.start < last/info.fps_float and e.end > start]
                         inputs, graph = effect_graph(edits, info.width, info.height, start, work, info.fps_float,
                                                      speed=count/result_count, stop=last/info.fps_float,
-                                                     pixel_aspect=sample_aspect(info), runner=runner)
+                                                     pixel_aspect=sample_aspect(info), runner=runner,
+                                                     transitions=video_fades)
                         args += inputs + ['-filter_complex', graph, '-map', '[out]'] + _encoder(info)
                     else:
                         if first:
@@ -396,7 +557,7 @@ class Exporter:
                 args = FFMPEG + ['-f', 'concat', '-safe', '0', '-i', str(listing), '-i', info.path,
                                  '-map', '0:v:0', '-map_metadata', '1', '-c:v', 'copy', '-avoid_negative_ts', 'disabled']
                 if retimed:
-                    args += edited_audio_options(info, project.edits, 0, index.frames, 1)
+                    args += edited_audio_options(info, project.edits, 0, index.frames, 1, audio_fades)
                     delay = int(info.video.get('has_b_frames', 0))
                     if delay:
                         # Very short pieces may have no B-frames even when the
@@ -432,14 +593,12 @@ class Exporter:
             runner.check()
             # Recheck for external changes before replacing a destination.
             project.check_source()
-            if destination.exists() and not overwrite:
-                raise ValueError('输出文件已被其他程序创建，请选择新路径。')
-            os.replace(pending, destination)
+            _publish_output(pending, destination, runner, overwrite=overwrite)
             runner.report(100, '导出完成')
             return ExportReport(str(destination), encoded, copied, frame_count, len(info.audio))
 
 
-def render_preview(project: Project, edit_index: int, destination, runner: Runner):
+def render_preview(project: Project, edit_index: int, destination, runner: Runner, *, with_timeline=False):
     project.check_source()
     info = probe(project.source, runner)
     project.validate(info.duration)
@@ -456,9 +615,21 @@ def render_preview(project: Project, edit_index: int, destination, runner: Runne
         context = max(1, round(info.fps_float))
         start = first if before is None else max(0, before-context)
         end = last if after is None else min(index.frames, after+context)
-        return _render_preview_range(project, info, start, min(end, index.frames), destination, runner)
+        video_fades, audio_fades = preview_transition_windows(project, info, index.frames)
+        for fade in [*video_fades, *audio_fades]:
+            if fade.direction == 'out' and fade.end == before:
+                start = min(start, fade.start)
+            if fade.direction == 'in' and fade.start == after:
+                end = max(end, fade.end)
+        return _render_preview_range(project, info, start, min(end, index.frames), destination, runner,
+                                     with_timeline=with_timeline, source_end=index.frames)
+    source_end = max(last, round(info.duration*info.fps_float))
+    video_fades, audio_fades = preview_transition_windows(project, info, source_end)
+    if any(fade.start < last and fade.end > first for fade in [*video_fades, *audio_fades]):
+        return _render_preview_range(project, info, first, last, destination, runner,
+                                     with_timeline=with_timeline, source_end=source_end)
     start, duration = first/info.fps_float, (last-first)/info.fps_float
-    with tempfile.TemporaryDirectory(prefix='qpixel-preview-') as directory:
+    with runner.workspace('qpixel-preview-') as directory:
         count = output_frames(first, last, edit.speed)
         effective = (last-first)/count
         inputs, graph = effect_graph([edit], info.width, info.height, start, Path(directory), info.fps_float, 960, effective,
@@ -474,22 +645,31 @@ def render_preview(project: Project, edit_index: int, destination, runner: Runne
                    ['-filter_complex', graph, '-map', '[out]'] + audio_maps + ['-t', f'{duration:.9f}', '-frames:v', str(count),
                     '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-pix_fmt', 'yuv420p',
                     '-c:a', 'aac', '-progress', 'pipe:1', str(destination)], duration, 1, 98)
+    if with_timeline:
+        return _preview_report(destination, [edit], first, last, [(first, last, edit.speed)], info.fps_float)
     return str(destination)
 
 
-def render_project_preview(project: Project, destination, runner: Runner):
+def render_project_preview(project: Project, destination, runner: Runner, *, with_timeline=False):
     project.check_source()
     info = probe(project.source, runner)
     project.validate(info.duration)
     index = index_video(info, runner)
-    return _render_preview_range(project, info, 0, index.frames, destination, runner)
+    return _render_preview_range(project, info, 0, index.frames, destination, runner, with_timeline=with_timeline)
 
 
-def _render_preview_range(project, info, start, end, destination, runner):
+def preview_transition_windows(project, info, source_end):
+    video = transition_windows(project.edits, 0, source_end, info.fps_float, 'video')
+    audio = transition_windows(project.edits, 0, source_end, info.fps_float, 'audio') if info.audio else []
+    return video, audio
+
+
+def _render_preview_range(project, info, start, end, destination, runner, *, with_timeline=False, source_end=None):
     destination = Path(destination).resolve()
     if destination in project.asset_paths():
         raise ValueError('预览不能覆盖源视频或遮挡素材。')
     fps = info.fps_float
+    video_fades, audio_fades = preview_transition_windows(project, info, source_end or end)
     kept = speed_sections(project.edits, start, end, fps)
     if not kept:
         raise ValueError('全部视频帧已设为删除，没有保留内容可预览。')
@@ -501,8 +681,7 @@ def _render_preview_range(project, info, start, end, destination, runner):
     for first, last, speed in kept:
         cuts = [first, *(f for f in motion_edges if speed == 1 and first < f < last), last]
         sections.extend((a, b, speed) for a, b in zip(cuts, cuts[1:]))
-    with tempfile.TemporaryDirectory(prefix='qpixel-preview-', dir=destination.parent) as directory:
-        work = Path(directory)
+    with runner.workspace('qpixel-preview-', fallback=destination.parent) as work:
         files = []
         retained = sum(b-a for a, b, _ in sections)
         rendered = 0
@@ -512,7 +691,8 @@ def _render_preview_range(project, info, start, end, destination, runner):
             offset, duration = first/fps, count/fps
             target = work / f'part-{i:04d}.mp4'
             inputs, graph = effect_graph(project.edits, info.width, info.height, offset, work, fps, 960,
-                                         (last-first)/count, stop=last/fps, pixel_aspect=sample_aspect(info), runner=runner)
+                                         (last-first)/count, stop=last/fps, pixel_aspect=sample_aspect(info), runner=runner,
+                                         transitions=video_fades)
             progress, weight = 5 + 85*rendered/retained, 85*(last-first)/retained
             runner.report(progress, f'正在生成真实效果预览 {i+1}/{len(sections)}…')
             args = FFMPEG + ['-seek_timestamp', '1', '-ss', f'{offset:.9f}', '-i', info.path] + inputs
@@ -526,9 +706,11 @@ def _render_preview_range(project, info, start, end, destination, runner):
         pending = work / 'preview.mp4'
         args = FFMPEG + ['-f', 'concat', '-safe', '0', '-i', str(listing), '-i', info.path, '-map', '0:v:0',
                          '-c:v', 'copy', '-movflags', '+faststart']
-        args += edited_audio_options(info, project.edits, start, end, 1)
+        args += edited_audio_options(info, project.edits, start, end, 1, audio_fades)
         runner.run(args + ['-progress', 'pipe:1', str(pending)], sum(d for _, d in files), 90, 9)
         runner.check()
         project.check_source()
-        os.replace(pending, destination)
+        _publish_output(pending, destination, runner)
+    if with_timeline:
+        return _preview_report(destination, project.edits, start, end, sections, fps, [*video_fades, *audio_fades])
     return str(destination)

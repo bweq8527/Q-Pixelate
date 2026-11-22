@@ -7,6 +7,17 @@ from q_pixelate.model import Edit, Layer, Project, Rect, Transform, plan_ranges
 
 
 class ModelTests(unittest.TestCase):
+    def test_deletion_transition_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.mp4'
+            source.write_bytes(b'video')
+            edit = Edit(1, 3, 'none', layers=[], omit=True, video_transition='white',
+                        audio_transition='fade', transition_duration=.6)
+            path = root / 'transition.qpixel'
+            Project(str(source), [edit]).save(path)
+            self.assertEqual(Project.load(path).edits, [edit])
+
     def test_workflow_options_and_tracked_blur_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

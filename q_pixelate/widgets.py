@@ -431,6 +431,7 @@ class Timeline(QWidget):
     selectionChanged = Signal(float, float)
     viewChanged = Signal(float)
     editActivated = Signal(int)
+    selectionModified = Signal(int, Qt.KeyboardModifier)
     editDragged = Signal(int, float, float, str)
     rangeCreated = Signal(float, float)
 
@@ -448,6 +449,7 @@ class Timeline(QWidget):
         self.anchor = 0
         self.selection_locked = False
         self.active_row = -1
+        self.selected_rows = set()
         self.minimum_span = .001
         self.drag_bounds = None
         self.candidate = None
@@ -501,18 +503,24 @@ class Timeline(QWidget):
                 p.drawText(x+4, 25, caption)
             t += step
         p.setClipRect(19, 42, self.width()-38, 62)
-        for edit in self.edits:
+        for row, edit in enumerate(self.edits):
             x1, x2 = self.point_for_time(edit.start).x(), self.point_for_time(edit.end).x()
             color = QColor('#815054') if edit.omit else QColor('#415568') if edit.locked else (
                 QColor('#296f69') if edit.effect != 'image' else QColor('#7460a0'))
             p.fillRect(QRectF(x1, 58, max(2, x2-x1), 34), color)
-        left, right = (self.point_for_time(t).x() for t in (self.candidate or self.selection))
-        p.fillRect(QRectF(left, 60, max(0, right-left), 42), QColor(110, 231, 192, 28))
-        p.setPen(QPen(QColor('#6ee7c0'), 2))
-        p.drawRect(QRectF(left, 60, max(0, right-left), 42))
-        if not self.selection_locked or self.candidate:
-            for x in (left, right):
-                p.fillRect(QRectF(x-3, 60, 6, 42), QColor('#6ee7c0'))
+            if row in self.selected_rows and row != self.active_row:
+                p.setPen(QPen(QColor('#6ee7c0'), 1))
+                p.drawRect(QRectF(x1, 60, max(2, x2-x1), 42))
+        first, last = self.candidate or self.selection
+        left, right = self.point_for_time(first).x(), self.point_for_time(last).x()
+        if first < last or self.candidate:
+            outline = QRectF(left, 60, max(2, right-left), 42)
+            p.fillRect(outline, QColor(110, 231, 192, 28))
+            p.setPen(QPen(QColor('#6ee7c0'), 2))
+            p.drawRect(outline)
+            if not self.selection_locked or self.candidate:
+                for x in (left, right):
+                    p.fillRect(QRectF(x-3, 60, 6, 42), QColor('#6ee7c0'))
         for start, end in self.detection_spans:
             x1, x2 = self.point_for_time(start).x(), self.point_for_time(end).x()
             p.fillRect(QRectF(x1, 96, max(2, x2-x1), 4), QColor('#ffb86b'))
@@ -521,7 +529,7 @@ class Timeline(QWidget):
         p.drawLine(x, 34, x, 52)
         p.setClipping(False)
         p.setPen(QColor('#9aacc2'))
-        p.drawText(20, 115, '上轨：播放定位    下轨：左键移动 / 调边，右键拖出选区    中键 / Alt 拖动：平移')
+        p.drawText(20, 115, '上轨：播放定位    下轨：右键拖出选区 · Ctrl 加选 · Shift 连选    中键 / Alt 拖动：平移')
         p.setClipping(False)
 
     def mousePressEvent(self, event):
@@ -578,6 +586,10 @@ class Timeline(QWidget):
         a, b = ranges[index]
         lo, hi = 0, self.duration
         if self.edits:
+            modifiers = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
+            if modifiers:
+                self.selectionModified.emit(index, modifiers)
+                return
             self.editActivated.emit(index)
             edit = self.edits[index]
             if self.active_row != index or edit.locked or edit.range_locked:

@@ -11,6 +11,66 @@ from q_pixelate.render import Exporter, render_preview, render_project_preview
 
 
 class RenderTests(unittest.TestCase):
+    def test_deletion_transitions_fade_picture_and_audio_without_shortening_output(self):
+        import array
+
+        from PIL import ImageStat
+
+        edit = Edit(2, 3, 'none', omit=True, video_transition='black',
+                    audio_transition='fade', transition_duration=.5)
+        out, report = self.export([edit], 'fade-splice.mp4')
+        preview = self.root / 'fade-splice-preview.mp4'
+        render_preview(Project(str(self.source), [edit]), 0, preview, Runner())
+        self.assertEqual(report.frames, 100)
+        self.assertEqual(hashes(out)[60:], self.original[80:])
+        for path, seam, frames in ((out, 40, 100), (preview, 20, 40)):
+            self.assertEqual(len(hashes(path)), frames)
+            for frame in (seam-1, seam):
+                self.assertLess(ImageStat.Stat(image_at(path, frame).convert('L')).mean[0], 8)
+            for frame in (seam-11, seam+11):
+                self.assertGreater(ImageStat.Stat(image_at(path, frame).convert('L')).mean[0], 40)
+            for track in (0, 1):
+                samples = array.array('h', command('ffmpeg', '-v', 'error', '-i', str(path),
+                                                  '-map', f'0:a:{track}', '-ar', '8000', '-f', 's16le', '-'))
+                center = seam*400
+                self.assertLess(max(abs(sample) for sample in samples[center-160:center+160]), 500)
+                self.assertGreater(max(abs(sample) for sample in samples[center+4400:center+4800]), 2500)
+
+    def test_short_selected_preview_keeps_the_fade_phase_at_its_boundary(self):
+        import array
+
+        from PIL import ImageStat
+
+        retained = Edit(1.85, 2, 'none', layers=[])
+        omitted = Edit(2, 3, 'none', omit=True, video_transition='white',
+                       audio_transition='fade', transition_duration=.5)
+        preview = self.root / 'short-fade-preview.mp4'
+        render_preview(Project(str(self.source), [retained, omitted]), 0, preview, Runner())
+        self.assertEqual(len(hashes(preview)), 3)
+        self.assertGreater(ImageStat.Stat(image_at(preview, 0).convert('L')).mean[0], 190)
+        self.assertGreater(ImageStat.Stat(image_at(preview, 2).convert('L')).mean[0], 245)
+        samples = array.array('h', command('ffmpeg', '-v', 'error', '-i', str(preview),
+                                          '-map', '0:a:0', '-ar', '8000', '-f', 's16le', '-'))
+        self.assertLess(max(abs(sample) for sample in samples[:1000]), 1500)
+
+    def test_deletion_transitions_shrink_around_one_retained_frame(self):
+        first = Edit(0, 1, 'none', omit=True, video_transition='black')
+        second = Edit(1.05, 5, 'none', omit=True, video_transition='black')
+        out, report = self.export([first, second], 'tiny-fade-splice.mp4')
+        self.assertEqual(report.frames, 21)
+        self.assertLess(max(image_at(out, 0).convert('L').getdata()), 8)
+        self.assertLess(max(image_at(out, 1).convert('L').getdata()), 8)
+
+    def test_deletion_transition_reaches_black_at_retimed_seam(self):
+        from PIL import ImageStat
+
+        edits = [Edit(1, 2, 'none', speed=4), Edit(2, 3, 'none', omit=True, video_transition='black'),
+                 Edit(3, 4, 'none', speed=4)]
+        out, report = self.export(edits, 'retimed-fade-splice.mp4')
+        self.assertEqual(report.frames, 70)
+        for frame in (24, 25):
+            self.assertLess(ImageStat.Stat(image_at(out, frame).convert('L')).mean[0], 8)
+
     def test_omit_retimes_all_audio_and_keeps_video_outside_removed_gops(self):
         edit = Edit(2.25, 3.15, 'blur', speed=.25, omit=True)
         out, report = self.export([edit], 'removed.mp4')

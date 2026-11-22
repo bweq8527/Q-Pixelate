@@ -10,6 +10,11 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 
+DEFAULT_TRANSITION_DURATION = .3
+VIDEO_TRANSITIONS = {'cut': '硬切', 'black': '淡出至黑 / 淡入', 'white': '淡出至白 / 淡入'}
+AUDIO_TRANSITIONS = {'cut': '硬切', 'fade': '淡出至静音 / 淡入'}
+
+
 @dataclass
 class Rect:
     x: float = .25
@@ -158,6 +163,9 @@ class Edit:
     layers: list[Layer] | None = None
     omit: bool = False
     speed_effect: bool = False
+    video_transition: str = 'cut'
+    audio_transition: str = 'cut'
+    transition_duration: float = DEFAULT_TRANSITION_DURATION
 
     def promote_layers(self, width, height):
         if self.layers is not None:
@@ -198,6 +206,12 @@ class Edit:
             raise ValueError('片段锁定状态无效。')
         if not isinstance(self.omit, bool) or not isinstance(self.speed_effect, bool):
             raise ValueError('段落效果状态无效。')
+        if (not isinstance(self.video_transition, str) or self.video_transition not in VIDEO_TRANSITIONS
+                or not isinstance(self.audio_transition, str) or self.audio_transition not in AUDIO_TRANSITIONS):
+            raise ValueError('未知的删除接缝过渡效果。')
+        if (type(self.transition_duration) not in (int, float)
+                or not .05 <= self.transition_duration <= 1):
+            raise ValueError('接缝两侧的过渡时长须为 0.05–1 秒。')
         if self.layers is not None:
             ids = set()
             for layer in self.layers:
@@ -272,6 +286,7 @@ class Project:
             except ValueError:
                 return str(Path(value).resolve())
         edits = []
+        has_transitions = False
         for edit in self.edits:
             raw = asdict(edit)
             if edit.layers is None:
@@ -288,8 +303,16 @@ class Project:
                     raw[key] = True
                 else:
                     raw.pop(key, None)
+            for key in ('video_transition', 'audio_transition', 'transition_duration'):
+                value = getattr(edit, key)
+                if value != Edit.__dataclass_fields__[key].default:
+                    raw[key] = value
+                    has_transitions = True
+                else:
+                    raw.pop(key, None)
             edits.append(raw)
-        version = (6 if any(e.omit or e.speed_effect or any(layer.kind == 'blur' and layer.motion for layer in e.layers or [])
+        version = (7 if has_transitions else
+                   6 if any(e.omit or e.speed_effect or any(layer.kind == 'blur' and layer.motion for layer in e.layers or [])
                             for e in self.edits)
                    else 5 if any(layer.kind == 'sticker' and layer.motion for e in self.edits for layer in e.layers or [])
                    else 4 if any(layer.kind == 'mosaic' for e in self.edits for layer in e.layers or [])
@@ -312,7 +335,7 @@ class Project:
         path = Path(path).resolve()
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
-            if not isinstance(data, dict) or data.get('version') not in (1, 2, 3, 4, 5, 6):
+            if not isinstance(data, dict) or data.get('version') not in (1, 2, 3, 4, 5, 6, 7):
                 raise ValueError('工程格式或版本不受支持。')
             def absolute(value):
                 if not isinstance(value, str):

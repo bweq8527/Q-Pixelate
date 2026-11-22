@@ -52,6 +52,17 @@ class ComponentDialog(QDialog):
             self.add_button(row, '打开', lambda _checked=False, path=directory: self.open_directory(path))
             self.location_controls.append(self.add_button(row, caption, callback))
             locations.addRow(label, row)
+        row = QHBoxLayout()
+        self.process_path = QLineEdit(str(manager.process_files.directory))
+        self.process_path.setReadOnly(True)
+        self.process_path.setToolTip('预览、导出和识别生成的过程文件使用此目录。')
+        row.addWidget(self.process_path, 1)
+        self.process_controls = [
+            self.add_button(row, '打开', lambda: self.open_directory(self.manager.process_files.directory)),
+            self.add_button(row, '更改位置…', self.choose_process_directory),
+            self.add_button(row, '恢复默认', lambda: self.set_process_directory(None)),
+        ]
+        locations.addRow('过程文件位置', row)
         layout.addLayout(locations)
         self.items = QListWidget()
         self.items.addItems(list(COMPONENTS.values()))
@@ -121,6 +132,8 @@ class ComponentDialog(QDialog):
             button.setEnabled(not busy)
         for button in self.location_controls:
             button.setEnabled(not busy and bool(self.launcher))
+        for button in self.process_controls:
+            button.setEnabled(not busy)
         self.reset.setEnabled(not busy and bool(self.manager.preferences().get('ffmpeg_directory')))
         self.install.setEnabled(not busy and can_manage and bool(local or entry.get('url')))
         self.install.setText('重新安装' if state.get('installed') else '安装本地包' if local else '下载安装')
@@ -227,7 +240,22 @@ class ComponentDialog(QDialog):
         if directory.is_dir():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
         else:
-            self.status.setText('安装目录尚未创建。')
+            self.status.setText('目录尚未创建。')
+
+    def choose_process_directory(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, '选择过程文件的存放位置', str(self.manager.process_files.directory.parent))
+        if folder:
+            self.set_process_directory(folder)
+
+    def set_process_directory(self, folder):
+        try:
+            self.manager.process_files.set_directory(folder)
+        except (OSError, ValueError, RuntimeError) as error:
+            self.status.setText(str(error))
+            return
+        self.process_path.setText(str(self.manager.process_files.directory))
+        self.status.setText('过程文件位置已保存，下次预览、导出或识别时生效。')
 
     def choose_program_location(self):
         if self.manager.installer:

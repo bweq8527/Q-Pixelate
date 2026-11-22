@@ -5,7 +5,6 @@ import math
 import os
 import queue
 import subprocess
-import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,14 +105,10 @@ def _follow(decode_args, worker_args, width, height, frames, fps, rect, runner):
         except Exception as exc:
             updates.put(('error', exc))
 
-    def open_scene_log(path, flags):
-        # Share delete access with the writer on Windows. Closing the last inherited
-        # handle then removes the log even when FFmpeg was terminated early.
-        return os.open(path, flags | getattr(os, 'O_TEMPORARY', 0))
-
-    with tempfile.NamedTemporaryFile(prefix='qpixel-track-') as decode_err, \
-            open(decode_err.name, 'rb', opener=open_scene_log) as scene_log, \
-            tempfile.TemporaryFile() as worker_err:
+    with runner.workspace('qpixel-track-') as directory, \
+            (directory / 'scene.log').open('w+b') as decode_err, \
+            (directory / 'scene.log').open('rb') as scene_log, \
+            (directory / 'worker.log').open('w+b') as worker_err:
         with _child(decode_args, subprocess.DEVNULL, decode_err, runner) as decoder, \
                 _child(worker_args, subprocess.PIPE, worker_err, runner) as worker:
             thread = threading.Thread(target=process_frames, daemon=True)

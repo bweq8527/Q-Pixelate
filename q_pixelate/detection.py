@@ -41,14 +41,14 @@ def detector_command(python, site_packages, model, device, *, probe=False, runti
     script = Path(__file__).resolve().with_name('detector_worker.py')
     args = [str(Path(python).resolve()), '-I', '-S', '-X', 'utf8', str(script),
             '--site-packages', str(Path(site_packages).resolve()), '--provider', PROVIDERS[device]]
+    if profile_dir is not None:
+        args += ['--profile-dir', str(profile_dir)]
     if runtime_probe:
         return args + ['--runtime-probe']
     args += ['--model', str(Path(model).resolve())]
     if probe:
         return args + ['--probe']
     args += ['--width', str(width), '--height', str(height)]
-    if profile_dir is not None:
-        args += ['--profile-dir', str(profile_dir)]
     return args
 
 
@@ -136,7 +136,7 @@ def _stream(decoder, worker, provider, width, height, samples, updates):
     return results
 
 
-def _scan_frames(decode_args, worker_args, provider, width, height, samples, runner):
+def _scan_frames(decode_args, worker_args, provider, width, height, samples, runner, directory):
     updates = queue.Queue()
 
     def process_frames():
@@ -145,7 +145,7 @@ def _scan_frames(decode_args, worker_args, provider, width, height, samples, run
         except Exception as exc:
             updates.put(('error', exc))
 
-    with tempfile.TemporaryFile() as decode_err, tempfile.TemporaryFile() as worker_err:
+    with tempfile.TemporaryFile(dir=directory) as decode_err, tempfile.TemporaryFile(dir=directory) as worker_err:
         with _child(decode_args, subprocess.DEVNULL, decode_err, runner) as decoder, \
                 _child(worker_args, subprocess.PIPE, worker_err, runner) as worker:
             thread = threading.Thread(target=process_frames, daemon=True)
@@ -253,11 +253,11 @@ def scan(info: MediaInfo, edit: Edit, runner: Runner, *, python, site_packages, 
     width, height = max(1, round(info.width*scale)), max(1, round(info.height*scale))
     runner.report(5, '正在启动识别进程…')
     decode_args = _decode_command(ffmpeg, info, index, samples, end, width, height)
-    with tempfile.TemporaryDirectory(prefix='qpixel-detect-') as temp:
+    with runner.workspace('qpixel-detect-') as temp:
         worker_args = detector_command(python, site_packages, model, device, width=width, height=height,
                                        profile_dir=temp)
         results, scene_times = _scan_frames(decode_args, worker_args, PROVIDERS[device], width, height,
-                                            samples, runner)
+                                            samples, runner, temp)
     runner.report(96, '正在整理识别结果…')
     cuts = sorted(round(time*fps) for time in scene_times)
     tracks = _group_tracks(results, cuts, step, fps, runner)

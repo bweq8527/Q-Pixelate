@@ -186,6 +186,53 @@ class EditorUpgradeTests(unittest.TestCase):
         self.assertEqual(sorted((e.start, e.end) for e in w.project.edits), [(1, 2), (2, 3), (3, 4)])
         self.assertEqual(seeks, [])
 
+    def test_timeline_multiselect_inverts_in_both_views_and_keeps_drafts(self):
+        w = self.window([Edit(3, 4, 'none', layers=[]), Edit(1, 2, 'none', layers=[]),
+                         Edit(4.5, 5.5, 'none', layers=[])])
+        t = w.timeline
+        t.resize(640, 120)
+        QTest.mouseClick(t, Qt.LeftButton, Qt.NoModifier, t.point_for_time(1.5))
+        w.add_full_blur()
+        QTest.mouseClick(t, Qt.LeftButton, Qt.ControlModifier, t.point_for_time(3.5))
+        self.assertEqual(t.selected_rows, {0, 1})
+        self.assertEqual({w.clip_list.row(item) for item in w.clip_list.selectedItems()}, {0, 1})
+        w.invert_clip_selection()
+        self.assertEqual(t.selected_rows, {2})
+        self.assertEqual(w.clip_list.currentRow(), 2)
+        QTest.mouseClick(t, Qt.LeftButton, Qt.ShiftModifier, t.point_for_time(1.5))
+        self.assertEqual(t.selected_rows, {0, 1, 2})
+        self.assertEqual(len(w.current_edit().layers), 1)
+        w.invert_clip_selection()
+        self.assertEqual(w.clip_list.selectedItems(), [])
+        self.assertFalse(w.preview_selection_button.isEnabled())
+        self.assertEqual(len(w._drafts[1].layers), 1)
+
+    def test_select_all_uncovered_ranges_includes_gaps_that_contain_a_frame(self):
+        w = self.window([Edit(.001, 1, 'none', layers=[]), Edit(2, 4.001, 'none', layers=[]),
+                         Edit(4.025, 4.075, 'none', layers=[])])
+        w.select_uncovered_ranges()
+        selected = {w.clip_list.row(item) for item in w.clip_list.selectedItems()}
+        self.assertEqual(selected, {3, 4, 5})
+        self.assertEqual([(w.project.edits[i].start, w.project.edits[i].end) for i in sorted(selected)],
+                         [(0, .001), (1, 2), (4.075, w.info.duration)])
+        w.select_uncovered_ranges()
+        self.assertEqual(len(w.project.edits), 6)
+        self.assertEqual(w.timeline.selected_rows, selected)
+
+    def test_list_multiselect_removes_only_unlocked_selected_ranges(self):
+        w = self.window([Edit(1, 2, 'none', layers=[]), Edit(2, 3, locked=True),
+                         Edit(3, 4, 'none', layers=[]), Edit(4, 5, 'none', layers=[])])
+        w.show()
+        self.app.processEvents()
+        item = w.clip_list.item(2)
+        w.clip_list.scrollToItem(item)
+        QTest.mouseClick(w.clip_list.viewport(), Qt.LeftButton, Qt.ShiftModifier,
+                         w.clip_list.visualItemRect(item).center())
+        self.assertEqual(w.timeline.selected_rows, {0, 1, 2})
+        w.delete_edit()
+        self.assertEqual([(e.start, e.end) for e in w.project.edits], [(2, 3), (4, 5)])
+        self.assertEqual(w.timeline.selected_rows, {0})
+
     def test_drop_creates_multiple_layers_and_mask_edits_do_not_move_sticker(self):
         w = self.window([Edit(1, 5, 'none', layers=[])])
         w.show()

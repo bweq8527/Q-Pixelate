@@ -13,11 +13,13 @@ import sys
 import tempfile
 import time
 import zipfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import copy
 from functools import lru_cache
 from pathlib import Path, PureWindowsPath
 from urllib.request import urlopen
+
+from .process import retry_windows_file_operation
 
 
 COMPONENTS = ('base', 'ffmpeg', 'cpu', 'gpu', '320n', '640m')
@@ -27,9 +29,9 @@ _TOOLS = ('ffmpeg', 'ffprobe')
 _MARKER = '.q-pixelate-component.json'
 _BLOCK_SIZE = 1024 * 1024
 _ENCODERS = {'libx264', 'aac', 'ffv1'}
-_FILTERS = {'alphaextract', 'alphamerge', 'apad', 'aresample', 'asetpts', 'asplit', 'atempo', 'atrim',
-            'blend', 'boxblur', 'concat', 'format', 'fps', 'gblur', 'maskedmerge', 'null', 'overlay',
-            'scale', 'scdet', 'select', 'setsar', 'setpts', 'settb', 'split', 'trim'}
+_FILTERS = {'afade', 'alphaextract', 'alphamerge', 'apad', 'aresample', 'asetpts', 'asplit', 'atempo', 'atrim',
+            'blend', 'boxblur', 'concat', 'fade', 'format', 'fps', 'gblur', 'maskedmerge', 'null', 'overlay',
+            'scale', 'scdet', 'select', 'setsar', 'setpts', 'settb', 'split', 'tpad', 'trim'}
 _BASE_PROBE = '''
 import struct, sys
 from PySide6.QtWidgets import QApplication
@@ -318,6 +320,12 @@ class ComponentManager:
     def component_directory(self):
         return self._directory
 
+    @property
+    def process_files(self):
+        from .process_files import ProcessFiles
+
+        return ProcessFiles(self._location_file.parent)
+
     def path(self, component):
         if component not in COMPONENTS:
             raise ComponentError(f'未知组件：{component}。')
@@ -533,9 +541,12 @@ class ComponentManager:
             if getattr(sys, 'frozen', False):
                 raise ComponentError('请先安装基础运行环境，再验证识别组件。')
             python = Path(sys.executable)
-        command = detector_command(python, directory / 'site-packages', model, device,
-                                   probe=model is not None, runtime_probe=model is None)
-        text = _run_probe(command, runner, timeout=90)
+        with ExitStack() as workspace:
+            profile = workspace.enter_context(self.process_files.workspace()) if device == 'gpu' else None
+            command = detector_command(python, directory / 'site-packages', model, device,
+                                       probe=model is not None, runtime_probe=model is None,
+                                       profile_dir=profile)
+            text = _run_probe(command, runner, timeout=90)
         try:
             provider = json.loads(text)['provider']
         except (TypeError, ValueError, KeyError) as error:
@@ -606,6 +617,8 @@ class ComponentManager:
                 path = Path(tools['ffmpeg']).parent
         elif installed and component == 'base' and entry.get('version') and version != entry['version']:
             message = f'基础运行环境需要从 {version} 更新至 {entry["version"]}。'
+        elif installed and component == 'base' and entry.get('sha256') and record['sha256'] != entry['sha256']:
+            message = f'基础运行环境 {version} 需要更新至本安装包附带的构建。'
         elif installed:
             try:
                 self._check_layout(component, path)
@@ -693,12 +706,12 @@ class ComponentManager:
                 runner.check()
                 previous = self._previous(component)
                 if target.exists():
-                    target.rename(previous)
+                    retry_windows_file_operation(lambda: target.rename(previous))
                 try:
-                    staged.rename(target)
+                    retry_windows_file_operation(lambda: staged.rename(target))
                 except OSError:
                     if previous.exists():
-                        previous.rename(target)
+                        retry_windows_file_operation(lambda: previous.rename(target))
                     raise
                 if previous.exists():
                     try:

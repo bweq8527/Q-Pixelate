@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
 )
 
+from .model import AUDIO_TRANSITIONS, VIDEO_TRANSITIONS
 from .parameter_widgets import ParamControl, WheelSafeComboBox
 from .stickers import STICKER_MIME
 
@@ -137,7 +138,19 @@ class LayerInspector(QWidget):
         self.speed = self.spin(.25, 4)
         self.speed.setSuffix(' ×')
         paragraph_form.addRow('片段速度', self.speed)
-        self.speed_label = paragraph_form.labelForField(self.speed)
+        self.paragraph_form = paragraph_form
+        self.video_transition = WheelSafeComboBox()
+        self.audio_transition = WheelSafeComboBox()
+        for combo, options in ((self.video_transition, VIDEO_TRANSITIONS),
+                               (self.audio_transition, AUDIO_TRANSITIONS)):
+            for kind, caption in options.items():
+                combo.addItem(caption, kind)
+        self.transition_duration = self.spin(.05, 1)
+        self.transition_duration.setSuffix(' 秒')
+        self.transition_duration.setToolTip('接缝前后各使用该时长，保留片段较短时会自动缩短。')
+        paragraph_form.addRow('视频过渡', self.video_transition)
+        paragraph_form.addRow('音频过渡', self.audio_transition)
+        paragraph_form.addRow('单侧过渡时长', self.transition_duration)
         self.paragraph_note = QLabel()
         self.paragraph_note.setWordWrap(True)
         paragraph_form.addRow(self.paragraph_note)

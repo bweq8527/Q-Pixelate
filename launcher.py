@@ -35,11 +35,12 @@ class LaunchOptions(NamedTuple):
     start_installer: Path | None
     remove_components: bool
     verify_installation: bool
+    remove_process_files: bool
 
     @property
     def maintenance(self):
         return bool(self.action or self.component_directory or self.relocate_program
-                    or self.start_installer or self.remove_components)
+                    or self.start_installer or self.remove_components or self.remove_process_files)
 
 
 def parse_options(arguments, working_directory):
@@ -52,6 +53,7 @@ def parse_options(arguments, working_directory):
     operations.add_argument('--relocate-program', action='store_true')
     operations.add_argument('--start-installer', metavar='FILE')
     operations.add_argument('--remove-installed-components', action='store_true')
+    operations.add_argument('--remove-process-files', action='store_true')
     operations.add_argument('--verify-installation', action='store_true')
     parser.add_argument('--remove-old-copy', action='store_true')
     if '--' in arguments:
@@ -79,7 +81,8 @@ def parse_options(arguments, working_directory):
     installer = (working_directory / options.start_installer).resolve() if options.start_installer else None
     return LaunchOptions(action, options.wait_pid, editor_args, options.setup,
                          component_directory, options.remove_old_copy, options.relocate_program,
-                         installer, options.remove_installed_components, options.verify_installation)
+                         installer, options.remove_installed_components, options.verify_installation,
+                         options.remove_process_files)
 
 
 def wait_for_editor(pid, runner):
@@ -353,16 +356,19 @@ def main():
     frozen = getattr(sys, 'frozen', False)
     launcher_path = Path(sys.executable if frozen else __file__).resolve()
     root = launcher_path.parent if frozen else os.environ.get('QPIXELATE_HOME', launcher_path.parent)
-    if options.verify_installation or options.remove_components:
+    if options.verify_installation or options.remove_components or options.remove_process_files:
         try:
             manager = ComponentManager(root)
-            if not manager.installer or not manager.installer.is_file():
+            if not manager.installer or (options.verify_installation and not manager.installer.is_file()):
                 return 1
             if options.verify_installation:
                 return 0 if all(component in manager.catalog for component in REQUIRED) else 1
             prepare_frozen_environment()
             if options.wait_pid:
                 wait_for_editor(options.wait_pid, Runner())
+            if options.remove_process_files:
+                manager.process_files.remove_abandoned()
+                return 0
             for component in reversed(TITLES):
                 if manager.status(component)['installed']:
                     manager.uninstall(component)

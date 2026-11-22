@@ -3,21 +3,49 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
+from pathlib import Path
 
 
 class Cancelled(Exception):
     pass
 
 
+def retry_windows_file_operation(operation):
+    """Give newly exited Windows processes time to release inherited handles."""
+    deadline = time.monotonic() + 1.5
+    while True:
+        try:
+            return operation()
+        except OSError as error:
+            if getattr(error, 'winerror', None) not in (5, 32) or time.monotonic() >= deadline:
+                raise
+            time.sleep(.05)
+
+
 class Runner:
-    def __init__(self, cancel_event=None, progress=None, log=None):
+    def __init__(self, cancel_event=None, progress=None, log=None, *, process_files=None):
         self.cancel_event = cancel_event or threading.Event()
         self.progress = progress or (lambda value, text: None)
         self.log = log or (lambda text: None)
         self._video_tools = None
+        self._process_files = process_files
+
+    @contextmanager
+    def workspace(self, prefix, *, fallback=None):
+        if self._process_files is not None:
+            with self._process_files.workspace() as path:
+                yield path
+        else:
+            directory = tempfile.TemporaryDirectory(prefix=prefix, dir=fallback)
+            try:
+                yield Path(directory.name)
+            finally:
+                retry_windows_file_operation(directory.cleanup)
 
     def check(self):
         if self.cancel_event.is_set():

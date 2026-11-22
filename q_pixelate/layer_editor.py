@@ -7,7 +7,7 @@ from PySide6.QtCore import QItemSelectionModel, QSignalBlocker, Qt
 from PySide6.QtGui import QImage
 
 from .layer_widgets import OMIT_LAYER, SPEED_LAYER, effect_rows
-from .model import Layer, Transform, frame_bounds
+from .model import DEFAULT_TRANSITION_DURATION, Layer, Transform, frame_bounds
 from .sticker_tracking import StickerTracking
 
 
@@ -27,6 +27,12 @@ class LayerEditing(StickerTracking):
         panel.start.valueChanged.connect(lambda value: self.set_layer_time('start', value))
         panel.end.valueChanged.connect(lambda value: self.set_layer_time('end', value))
         panel.speed.valueChanged.connect(self.set_paragraph_speed)
+        panel.video_transition.currentIndexChanged.connect(
+            lambda: self.set_paragraph_transition(video_transition=panel.video_transition.currentData()))
+        panel.audio_transition.currentIndexChanged.connect(
+            lambda: self.set_paragraph_transition(audio_transition=panel.audio_transition.currentData()))
+        panel.transition_duration.valueChanged.connect(
+            lambda value: self.set_paragraph_transition(transition_duration=value))
         panel.kind.activated.connect(self.set_layer_kind)
         panel.asset.clicked.connect(self.use_library_asset)
         panel.target.currentIndexChanged.connect(self.change_layer_target)
@@ -91,7 +97,8 @@ class LayerEditing(StickerTracking):
         visual = [item for item in edit.layers if item.id in chosen]
         compatible = bool(visual) and len(visual) == len(chosen)
         widgets = (panel.picker, panel.name, panel.kind, panel.target, panel.start, panel.end,
-                   panel.strength, panel.feather, panel.speed, *panel.geometry)
+                   panel.strength, panel.feather, panel.speed, panel.video_transition,
+                   panel.audio_transition, panel.transition_duration, *panel.geometry)
         blockers = [QSignalBlocker(widget) for widget in widgets]
         picker = panel.picker
         rebuilt = [picker.item(i).text() for i in range(picker.count())] != captions
@@ -119,12 +126,20 @@ class LayerEditing(StickerTracking):
 
         panel.paragraph.setVisible(bool(chosen) and not compatible)
         speed_only = chosen == {SPEED_LAYER}
-        panel.speed.setVisible(speed_only)
-        panel.speed_label.setVisible(speed_only)
+        omit_only = chosen == {OMIT_LAYER}
+        panel.paragraph_form.setRowVisible(panel.speed, speed_only)
         panel.speed.setEnabled(editable)
         panel.speed.setValue(edit.speed)
-        if chosen == {OMIT_LAYER}:
-            panel.paragraph_note.setText('预览和导出跳过整个选区。删除此效果可恢复播放及原有图层设置。')
+        for widget in (panel.video_transition, panel.audio_transition, panel.transition_duration):
+            panel.paragraph_form.setRowVisible(widget, omit_only)
+            widget.setEnabled(editable)
+        panel.video_transition.setCurrentIndex(panel.video_transition.findData(edit.video_transition))
+        panel.audio_transition.setCurrentIndex(panel.audio_transition.findData(edit.audio_transition))
+        panel.transition_duration.setValue(edit.transition_duration)
+        panel.transition_duration.setEnabled(editable and (
+            edit.video_transition != 'cut' or edit.audio_transition != 'cut'))
+        if omit_only:
+            panel.paragraph_note.setText('预览和导出跳过整个选区，并对接缝两侧的保留内容应用过渡。移除此效果可恢复该段。')
         elif speed_only:
             panel.paragraph_note.setText('整个选区的画面和声音同步变速。当前会优先跳过该段。' if edit.omit
                                          else '整个选区的画面和声音同步变速。')
@@ -302,6 +317,13 @@ class LayerEditing(StickerTracking):
         edit = self.layer_edit()
         if edit and not edit.locked and self.layer_selection(edit) == {SPEED_LAYER} and edit.speed != value:
             self.store_layer_edit(replace(edit, speed=value, speed_effect=True))
+
+    def set_paragraph_transition(self, **changes):
+        edit = self.layer_edit()
+        if edit and not edit.locked and self.layer_selection(edit) == {OMIT_LAYER}:
+            updated = replace(edit, **changes)
+            if updated != edit:
+                self.store_layer_edit(updated)
 
     def add_layer(self, edit, layer, target):
         self.cancel_layer_interaction()
@@ -581,6 +603,9 @@ class LayerEditing(StickerTracking):
         updated = replace(edit, layers=layers, omit=edit.omit and OMIT_LAYER not in chosen,
                           speed=1 if SPEED_LAYER in chosen else edit.speed,
                           speed_effect=edit.speed_effect and SPEED_LAYER not in chosen)
+        if OMIT_LAYER in chosen:
+            updated = replace(updated, video_transition='cut', audio_transition='cut',
+                              transition_duration=DEFAULT_TRANSITION_DURATION)
         old_rows = effect_rows(edit)
         first_removed = next(i for i, (layer_id, _) in enumerate(old_rows) if layer_id in chosen)
         rows = effect_rows(updated)

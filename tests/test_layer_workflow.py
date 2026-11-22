@@ -84,6 +84,19 @@ class LayerWorkflowTests(unittest.TestCase):
         self.assertAlmostEqual(followed.x, right.x)
         self.assertAlmostEqual(followed.y, right.y)
 
+    def test_omit_inspector_stores_independent_video_and_audio_transitions(self):
+        w = self.window([], omit=True)
+        w.select_effect_layer('@omit')
+        panel = w.layer_panel
+        self.assertFalse(panel.transition_duration.isEnabled())
+        panel.video_transition.setCurrentIndex(panel.video_transition.findData('white'))
+        panel.audio_transition.setCurrentIndex(panel.audio_transition.findData('fade'))
+        panel.transition_duration.setValue(.7)
+        w.apply_edit()
+        edit = w.project.edits[0]
+        self.assertEqual((edit.video_transition, edit.audio_transition, edit.transition_duration),
+                         ('white', 'fade', .7))
+
     def test_removing_omit_effect_restores_retained_speed_and_layers(self):
         original = Layer(0, 2, name='保留的效果')
         w = self.window([original], omit=True, speed_effect=True, speed=2)

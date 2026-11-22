@@ -4,19 +4,19 @@ import copy
 import os
 import subprocess
 import sys
-import tempfile
 import time
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QSignalBlocker, QTimer, QEvent, QPointF
+from PySide6.QtCore import Qt, QUrl, QSignalBlocker, QTimer, QEvent, QPointF, QItemSelectionModel
 from PySide6.QtGui import QDesktopServices, QFont, QIcon
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QPushButton,
     QProgressBar, QScrollArea, QScrollBar, QSplitter, QTabWidget, QTextEdit,
-    QVBoxLayout, QWidget, QAbstractSpinBox, QLineEdit,
+    QVBoxLayout, QWidget, QAbstractSpinBox, QLineEdit, QAbstractItemView, QMenu,
 )
 
 from .jobs import Worker
@@ -26,9 +26,10 @@ from .components import ComponentManager
 from .layer_editor import LayerEditing
 from .layer_widgets import LayerInspector, LayerTimeline, StickerList
 from .media import probe
-from .model import Edit, Project, Rect
+from .model import Edit, Project, Rect, frame_bounds
 from .render import Exporter, render_preview
 from .parameter_widgets import ParamControl, WheelSafeComboBox
+from .preview_widgets import EDIT_COLORS, PreviewProgress
 from .widgets import Timeline, VideoCanvas, time_text
 from .stickers import StickerLibrary
 
@@ -50,6 +51,9 @@ QPushButton#danger { color: #f1acac; }
 QListWidget, QTextEdit { background: #111923; border: 1px solid #304057; border-radius: 6px; padding: 5px; }
 QListWidget::item { padding: 9px 5px; border-radius: 4px; }
 QListWidget::item:selected { background: #284d49; color: #b8ffe7; }
+QMenu { background: #1b2939; border: 1px solid #35475f; padding: 4px; }
+QMenu::item { padding: 6px 20px; }
+QMenu::item:selected { background: #315f56; }
 QDoubleSpinBox, QComboBox, QLineEdit { background: #101923; border: 1px solid #35465c; border-radius: 5px; padding: 5px; }
 QComboBox QAbstractItemView { background: #1b2939; selection-background-color: #315f56; }
 QSlider::groove:horizontal { background: #2e3c50; height: 5px; border-radius: 2px; }
@@ -86,7 +90,7 @@ def label(text, name='muted'):
 
 
 class PreviewDialog(QDialog):
-    def __init__(self, path, parent, *, whole=False):
+    def __init__(self, path, parent, *, whole=False, spans=()):
         super().__init__(parent)
         self.setWindowTitle(('成片预览' if whole else '片段预览') + ' · Q-Pixelate')
         self.resize(960, 650)
@@ -102,14 +106,77 @@ class PreviewDialog(QDialog):
         self.player.setVideoSink(self.sink)
         self.sink.videoFrameChanged.connect(self.canvas.set_frame)
         self.player.setLoops(QMediaPlayer.Loops.Infinite)
-        self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.progress = PreviewProgress(spans)
+        self.progress.setEnabled(False)
+        self.position_label = label('')
+        self._resume_after_scrub = False
+        self._scrub_timer = QTimer(self)
+        self._scrub_timer.setSingleShot(True)
+        self._scrub_timer.setInterval(40)
+        self._scrub_timer.timeout.connect(self._seek_to_progress)
+        self.progress.sliderPressed.connect(self._start_scrub)
+        self.progress.sliderReleased.connect(self._finish_scrub)
+        self.progress.valueChanged.connect(self._progress_changed)
+        self.player.durationChanged.connect(self._update_duration)
+        self.player.seekableChanged.connect(self._update_duration)
+        self.player.positionChanged.connect(self._update_position)
+        layout.addWidget(self.progress)
+        if self.progress.kinds:
+            legend = '　'.join(
+                f'<span style="color: {color}">■</span> {name}'
+                for name, color in (EDIT_COLORS[kind] for kind in self.progress.kinds))
+            legend_label = label(legend)
+            legend_label.setTextFormat(Qt.TextFormat.RichText)
+            legend_label.setWordWrap(True)
+            layout.addWidget(legend_label)
         row = QHBoxLayout()
         row.addWidget(button('播放 / 暂停', self.toggle))
         row.addWidget(button('重新播放', lambda: (self.player.setPosition(0), self.player.play())))
         row.addStretch()
+        row.addWidget(self.position_label)
         row.addWidget(button('关闭预览', self.close))
         layout.addLayout(row)
+        self._update_duration()
+        self.player.setSource(QUrl.fromLocalFile(str(path)))
         self.player.play()
+
+    def _update_duration(self):
+        duration = self.player.duration()
+        with QSignalBlocker(self.progress):
+            self.progress.setRange(0, duration)
+        self.progress.setEnabled(duration > 0 and self.player.isSeekable())
+        self._update_position(self.player.position())
+
+    def _show_time(self, position):
+        self.position_label.setText(f'{time_text(position / 1000)} / {time_text(self.progress.maximum() / 1000)}')
+
+    def _update_position(self, position):
+        if not self.progress.isSliderDown():
+            with QSignalBlocker(self.progress):
+                self.progress.setValue(position)
+            self._show_time(position)
+
+    def _seek_to_progress(self):
+        self.player.setPosition(self.progress.value())
+
+    def _progress_changed(self, position):
+        self._show_time(position)
+        if not self.progress.isSliderDown():
+            self._seek_to_progress()
+        elif not self._scrub_timer.isActive():
+            self._scrub_timer.start()
+
+    def _start_scrub(self):
+        self._resume_after_scrub = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        if self._resume_after_scrub:
+            self.player.pause()
+
+    def _finish_scrub(self):
+        self._scrub_timer.stop()
+        self._seek_to_progress()
+        if self._resume_after_scrub:
+            self.player.play()
+        self._resume_after_scrub = False
 
     def toggle(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -117,10 +184,11 @@ class PreviewDialog(QDialog):
         else:
             self.player.play()
 
-    def closeEvent(self, event):
+    def done(self, result):
+        self._scrub_timer.stop()
         self.player.stop()
         self.player.setSource(QUrl())
-        event.accept()
+        super().done(result)
 
 
 class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
@@ -142,6 +210,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self._closing = False
         self._pause_on_frame = False
         self._editing_row = -1
+        self._clip_selection_anchor = -1
         self._drafts = {}
         self._layer_id = None
         self._layer_target = 'sticker'
@@ -161,7 +230,8 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.shuttle_timer = QTimer(self)
         self.shuttle_timer.setInterval(60)
         self.shuttle_timer.timeout.connect(self.shuttle_tick)
-        self.preview_temp = tempfile.TemporaryDirectory(prefix='qpixel-ui-')
+        self.preview_workspaces = {}
+        self.preview_cleanup = ExitStack()
         self.preview_dialogs = []
         self.setAcceptDrops(True)
         root = QWidget()
@@ -241,14 +311,18 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.clip_list = QListWidget()
         self.clip_list.setMinimumHeight(100)
         self.clip_list.setMaximumHeight(140)
-        self.clip_list.currentRowChanged.connect(self.select_edit)
+        self.clip_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.clip_list.setToolTip('Ctrl 加选或取消，Shift 连选。')
+        self.clip_list.itemSelectionChanged.connect(self.sync_clip_selection)
+        self.clip_list.currentRowChanged.connect(self.sync_clip_selection)
         side_layout.addWidget(self.clip_list, 1)
         row = QHBoxLayout()
         row.addWidget(button('＋ 添加选区', self.add_selection, True))
-        remove = button('移除选区设置', self.delete_edit)
-        remove.setToolTip('移除编辑设置。要从成片剪掉音画，请使用「直接删除段落」。')
-        remove.setObjectName('danger')
-        row.addWidget(remove)
+        self.remove_clips_button = button('移除选区设置', self.delete_edit)
+        self.remove_clips_button.setToolTip('移除选中的选区设置。要从成片剪掉音画，请使用「直接删除段落」。')
+        self.remove_clips_button.setObjectName('danger')
+        self.remove_clips_button.setEnabled(False)
+        row.addWidget(self.remove_clips_button)
         side_layout.addLayout(row)
         workflow = QHBoxLayout()
         self.new_button = button('选择新片段', self.new_selection)
@@ -367,6 +441,13 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         timeline_header.addWidget(label('源视频时间轴', 'section'))
         timeline_header.addWidget(label('  I / O 设入出点 · Ctrl+L 锁定长度 · 空格播放 / 暂停'))
         timeline_header.addStretch()
+        clip_choices = QPushButton('选区操作')
+        clip_menu = QMenu(clip_choices)
+        clip_menu.addAction('选择全部已有选区', self.select_all_clips)
+        clip_menu.addAction('反选已有选区', self.invert_clip_selection)
+        clip_menu.addAction('为剩余片段创建选区并选中', self.select_uncovered_ranges)
+        clip_choices.setMenu(clip_menu)
+        timeline_header.addWidget(clip_choices)
         self.in_button = button('设为入点 I', self.set_in)
         self.out_button = button('设为出点 O', self.set_out)
         timeline_header.addWidget(self.in_button)
@@ -396,6 +477,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.timeline.selectionChanged.connect(self.set_selection)
         self.timeline.seekRequested.connect(self.seek)
         self.timeline.editActivated.connect(self.activate_from_timeline)
+        self.timeline.selectionModified.connect(self.modify_timeline_selection)
         self.timeline.editDragged.connect(self.drag_selection)
         self.timeline.rangeCreated.connect(self.create_ranges)
         layout.addWidget(self.body, 1)
@@ -583,7 +665,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             return
         self.stop_shuttle()
         self.player.pause()
-        worker = Worker(task, self)
+        worker = Worker(task, self, process_files=self.components.process_files)
         self.worker = worker
         worker.succeeded.connect(callback)
         worker.failed.connect(self.error)
@@ -808,12 +890,75 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             self.clip_list.item(row).setText(self.edit_caption(row, self.timeline.edits[row]))
 
     def activate_from_timeline(self, row):
-        if row != self._editing_row:
-            with QSignalBlocker(self.clip_list):
-                self.clip_list.setCurrentRow(row)
-            self.select_edit(row, keep_draft=True)
+        self.select_edit(row, keep_draft=True)
 
-    def create_ranges(self, start, end):
+    def modify_timeline_selection(self, row, modifiers):
+        current = self.timeline.selected_rows
+        if modifiers & Qt.ShiftModifier:
+            ordered = sorted(range(len(self.timeline.edits)), key=lambda i: self.timeline.edits[i].start)
+            anchor = self._clip_selection_anchor if self._clip_selection_anchor in ordered else row
+            a, b = sorted((ordered.index(anchor), ordered.index(row)))
+            rows = set(ordered[a:b+1])
+            if modifiers & Qt.ControlModifier:
+                rows |= current
+            self.set_clip_selection(rows, row)
+        else:
+            self.set_clip_selection(current ^ {row}, row)
+            self._clip_selection_anchor = row
+
+    def select_all_clips(self):
+        self.set_clip_selection(set(range(self.clip_list.count())), self._editing_row)
+        self._clip_selection_anchor = self._editing_row
+
+    def invert_clip_selection(self):
+        self.set_clip_selection(set(range(self.clip_list.count())) - self.timeline.selected_rows)
+        self._clip_selection_anchor = self._editing_row
+
+    def sync_clip_selection(self, *args):
+        rows = {self.clip_list.row(item) for item in self.clip_list.selectedItems()}
+        row = self.clip_list.currentRow()
+        if row not in rows:
+            row = self._editing_row if self._editing_row in rows else min(rows, default=-1)
+        if row != self._editing_row:
+            if row >= 0 and not self.load_edit_form(row):
+                self.set_clip_selection(self.timeline.selected_rows, self._editing_row)
+                return
+            if row < 0:
+                self.stash_edit()
+                self.clear_active_edit()
+            self._clip_selection_anchor = row
+        self.show_clip_selection(rows)
+
+    def set_clip_selection(self, rows, preferred=-1):
+        row = preferred if preferred in rows else (
+            self._editing_row if self._editing_row in rows else min(rows, default=-1))
+        if row != self._editing_row:
+            if row >= 0:
+                self.load_edit_form(row, keep_draft=True)
+            else:
+                self.stash_edit()
+                self.clear_active_edit()
+        with QSignalBlocker(self.clip_list):
+            self.clip_list.setCurrentRow(row, QItemSelectionModel.SelectionFlag.NoUpdate)
+            old = {self.clip_list.row(item) for item in self.clip_list.selectedItems()}
+            for index in old ^ rows:
+                self.clip_list.item(index).setSelected(index in rows)
+        self.show_clip_selection(rows)
+
+    def show_clip_selection(self, rows):
+        self.timeline.selected_rows = rows
+        count = self.clip_list.count()
+        self.count_label.setText(f'{count} 段 · 已选 {len(rows)} 段' if rows else f'{count} 段')
+        self.remove_clips_button.setEnabled(any(not self.project.edits[row].locked for row in rows))
+        self.preview_selection_button.setText('预览活动选区' if len(rows) > 1 else '预览所选片段')
+        self.confirm_button.setText('确认活动选区' if len(rows) > 1 else '确认修改')
+        self.timeline.update()
+
+    def select_uncovered_ranges(self):
+        if self.info:
+            self.create_ranges(0, self.info.duration, select_all=True)
+
+    def create_ranges(self, start, end, *, select_all=False):
         if not self.project or start >= end:
             return
         self.stash_edit()
@@ -828,14 +973,23 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             cursor = max(cursor, edit.end)
         if cursor < end:
             gaps.append((cursor, end))
-        minimum = self.timeline.minimum_span
-        new = [Edit(a, b, 'none', layers=[]) for a, b in gaps if b-a >= minimum-1e-8]
+        new = []
+        for a, b in gaps:
+            edit = Edit(a, b, 'none', layers=[])
+            if select_all:
+                first, last = frame_bounds(edit, self.info.fps_float)
+                if first >= last:
+                    continue
+            elif b-a < self.timeline.minimum_span-1e-8:
+                continue
+            new.append(edit)
         if not new:
-            self.status.setText('拖动范围内没有至少一帧的空白时间。')
+            self.status.setText('范围内没有至少一帧的空白时间。')
             return
         first = len(self.project.edits)
         self.project.edits.extend(new)
-        self.refresh_edits(first)
+        rows = set(range(first, first+len(new))) if select_all else None
+        self.refresh_edits(first, rows)
         self.changed()
 
     def add_selection(self):
@@ -850,7 +1004,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             edit = replace(edit, layers=[replace(layer, start=layer.start+delta, end=layer.end+delta)
                                          for layer in edit.layers])
         self._drafts[row] = replace(edit, start=start, end=end)
-        self.refresh_edits(row)
+        self.refresh_edits(row, self.timeline.selected_rows)
         self.changed()
 
     def add_edit(self):
@@ -873,7 +1027,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.changed()
 
     def apply_edit(self):
-        row = self.clip_list.currentRow()
+        row = self._editing_row
         if not self.project or row < 0:
             self.status.setText('请先添加片段或在列表中选择要修改的片段。')
             return False
@@ -898,6 +1052,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.timeline.edits[row] = edit
         self.clip_list.item(row).setText(self.edit_caption(row, edit))
         self.update_edit_controls()
+        self.show_clip_selection(self.timeline.selected_rows)
         self.changed()
         self.status.setText('修改已确认。')
         return True
@@ -909,22 +1064,20 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             return False
         return True
 
-    def refresh_edits(self, selected=-1):
+    def refresh_edits(self, selected=-1, selected_rows=None):
         self._editing_row = -1
-        blocker = QSignalBlocker(self.clip_list)
-        self.clip_list.clear()
+        self._clip_selection_anchor = selected
         edits = [self._drafts.get(i, edit) for i, edit in enumerate(self.project.edits)]
-        for i, edit in enumerate(edits):
-            self.clip_list.addItem(self.edit_caption(i, edit))
-        self.clip_list.setCurrentRow(selected)
-        self.count_label.setText(f'{len(self.project.edits)} 段')
+        with QSignalBlocker(self.clip_list):
+            self.clip_list.clear()
+            for i, edit in enumerate(edits):
+                self.clip_list.addItem(self.edit_caption(i, edit))
         self.timeline.edits = edits
-        self.timeline.active_row = selected
-        self.timeline.update()
-        del blocker
-        if selected >= 0:
-            self.select_edit(selected)
-        else:
+        self.timeline.active_row = -1
+        if selected_rows is None:
+            selected_rows = {selected} if selected >= 0 else set()
+        self.set_clip_selection(selected_rows, selected)
+        if not selected_rows:
             self.sync_detection()
 
     def edit_caption(self, row, edit):
@@ -938,18 +1091,22 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
                 f'      {summary} · {edit.speed:g}× · {lock}')
 
     def select_edit(self, row, keep_draft=False):
+        if row == self._editing_row or self.load_edit_form(row, keep_draft):
+            if row >= 0:
+                self.set_clip_selection({row}, row)
+                self._clip_selection_anchor = row
+
+    def load_edit_form(self, row, keep_draft=False):
         if not self.project or row < 0 or row >= len(self.project.edits):
-            return
+            return False
         previous = self._editing_row
         if 0 <= previous < len(self.project.edits) and previous != row and not self._loading_form:
             pending = self.current_edit()
             if keep_draft or pending.layers is not None:
                 self.stash_edit()
             elif not self.project.edits[previous].locked and pending != self.project.edits[previous]:
-                blocker = QSignalBlocker(self.clip_list)
-                self.clip_list.setCurrentRow(previous)
                 self.status.setText('请先确认当前片段，再切换片段。')
-                return
+                return False
         edit = self._drafts.get(row, self.project.edits[row])
         was_loading = self._loading_form
         self._loading_form = True
@@ -974,17 +1131,24 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.canvas.draw_new = False
         self._loading_form = was_loading
         self.update_edit_controls()
+        return True
 
     def delete_edit(self):
-        row = self.clip_list.currentRow()
-        if self.project and row >= 0 and not self.project.edits[row].locked:
-            del self.project.edits[row]
-            self._drafts = {i-(i > row): edit for i, edit in self._drafts.items() if i != row}
-            self.refresh_edits(min(row, len(self.project.edits)-1))
-            if not self.project.edits:
-                self._range_locked = False
-                self.update_edit_controls()
-            self.changed()
+        selected = self.timeline.selected_rows
+        remove = {row for row in selected if not self.project.edits[row].locked}
+        if not remove:
+            return
+        if self._editing_row not in remove:
+            self.stash_edit()
+        kept = [row for row in range(len(self.project.edits)) if row not in remove]
+        self.project.edits[:] = [self.project.edits[row] for row in kept]
+        self._drafts = {index: self._drafts[row] for index, row in enumerate(kept) if row in self._drafts}
+        retained_selection = {index for index, row in enumerate(kept) if row in selected}
+        next_row = min(retained_selection, default=min(min(remove), len(kept)-1))
+        self.refresh_edits(next_row, retained_selection or None)
+        if not kept:
+            self.clear_active_edit()
+        self.changed()
 
     def effect_changed(self, index=None):
         index = self.effect.currentIndex()
@@ -1132,19 +1296,24 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             self.project.edits[self._editing_row].locked = False
             if self.project.edits[self._editing_row].layers is not None:
                 self.project.edits[self._editing_row].range_locked = False
-            self.refresh_edits(self._editing_row)
+            self.refresh_edits(self._editing_row, self.timeline.selected_rows)
             self.changed()
 
-    def new_selection(self):
-        self.stash_edit()
-        blocker = QSignalBlocker(self.clip_list)
-        self.clip_list.setCurrentRow(-1)
+    def clear_active_edit(self):
         self._editing_row = -1
         self.cancel_layer_interaction()
         self._layer_id = None
         self.reset_layer_selection()
         self.timeline.active_row = -1
         self._range_locked = False
+        self.set_selection(0, 0)
+        self.update_edit_controls()
+
+    def new_selection(self):
+        if not self.info:
+            return
+        self.set_clip_selection(set())
+        self._clip_selection_anchor = -1
         self._loading_form = True
         self.effect.setCurrentIndex(0)
         self.speed.setValue(1)
@@ -1336,16 +1505,24 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             self.error(str(exc))
             return
         self.player.pause()
-        path = Path(self.preview_temp.name) / f'preview-{len(self.preview_dialogs)}.mp4'
+        files = self.components.process_files
+        try:
+            root = files.directory
+            if root not in self.preview_workspaces:
+                self.preview_workspaces[root] = self.preview_cleanup.enter_context(files.workspace())
+            path = self.preview_workspaces[root] / f'preview-{len(self.preview_dialogs)}.mp4'
+        except (OSError, ValueError, RuntimeError) as error:
+            self.error(str(error))
+            return
         def done(result):
-            dialog = PreviewDialog(result, self, whole=row is None)
+            dialog = PreviewDialog(result.path, self, whole=row is None, spans=result.spans)
             self.preview_dialogs.append(dialog)
             dialog.show()
             self.status.setText('真实效果预览已生成；参数修改后请重新预览。')
         if row is None:
-            self.start_job(lambda runner: render_project_preview(project, path, runner), done)
+            self.start_job(lambda runner: render_project_preview(project, path, runner, with_timeline=True), done)
         else:
-            self.start_job(lambda runner: render_preview(project, row, path, runner), done)
+            self.start_job(lambda runner: render_preview(project, row, path, runner, with_timeline=True), done)
 
     def choose_export(self):
         if not self.project:
@@ -1474,7 +1651,8 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.library_dialog.close()
         for dialog in self.preview_dialogs:
             dialog.close()
-        self.preview_temp.cleanup()
+        self.preview_cleanup.close()
+        self.preview_workspaces.clear()
         event.accept()
 
 
