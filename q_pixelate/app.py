@@ -9,13 +9,13 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QSignalBlocker, QTimer, QEvent
+from PySide6.QtCore import Qt, QUrl, QSignalBlocker, QTimer, QEvent, QPointF
 from PySide6.QtGui import QDesktopServices, QFont, QIcon
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QPushButton,
-    QProgressBar, QScrollArea, QScrollBar, QSlider, QSplitter, QTabWidget, QTextEdit,
+    QProgressBar, QScrollArea, QScrollBar, QSplitter, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget, QAbstractSpinBox, QLineEdit,
 )
 
@@ -28,7 +28,8 @@ from .layer_widgets import LayerInspector, LayerTimeline, StickerList
 from .media import probe
 from .model import Edit, Project, Rect
 from .render import Exporter, render_preview
-from .widgets import Timeline, TimeSpinBox, VideoCanvas, time_text
+from .parameter_widgets import ParamControl, WheelSafeComboBox
+from .widgets import Timeline, VideoCanvas, time_text
 from .stickers import StickerLibrary
 
 
@@ -64,7 +65,7 @@ QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; background: tr
 QTabWidget::pane { border: 1px solid #283548; background: #171f2b; border-radius: 6px; }
 QTabBar::tab { background: #202b3a; padding: 7px 12px; }
 QTabBar::tab:selected { background: #31534f; color: #b8ffe7; }
-QWidget#layerProperties { background: #171f2b; }
+QWidget#layerProperties, QWidget#effectsPanel { background: #171f2b; }
 QSplitter::handle { background: #263246; }
 QToolTip { background: #25374b; color: #e6f2ff; border: 1px solid #52708e; }
 '''
@@ -85,12 +86,12 @@ def label(text, name='muted'):
 
 
 class PreviewDialog(QDialog):
-    def __init__(self, path, parent):
+    def __init__(self, path, parent, *, whole=False):
         super().__init__(parent)
-        self.setWindowTitle('真实效果预览 · Q-Pixelate')
+        self.setWindowTitle(('成片预览' if whole else '片段预览') + ' · Q-Pixelate')
         self.resize(960, 650)
         layout = QVBoxLayout(self)
-        layout.addWidget(label('已渲染的片段效果 · 与导出使用相同的滤镜，预览分辨率最高 960px'))
+        layout.addWidget(label('已渲染预览 · 包含画面效果、删段与倍速，预览宽度最高 960px'))
         self.canvas = VideoCanvas()
         self.canvas.auto_dimensions = True
         layout.addWidget(self.canvas, 1)
@@ -175,10 +176,12 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.open_button = button('打开视频', self.choose_video)
         self.load_button = button('载入工程', self.choose_project)
         self.save_button = button('保存工程', self.save_project)
+        self.library_button = button('贴纸素材', self.show_sticker_library)
         self.export_button = button('缝合导出  ↗', self.choose_export, True)
         self.settings_button = button('设置', self.open_components)
         self.settings_button.setToolTip('环境与组件')
-        for widget in (self.open_button, self.load_button, self.save_button, self.settings_button, self.export_button):
+        for widget in (self.open_button, self.load_button, self.save_button, self.library_button,
+                       self.settings_button, self.export_button):
             header.addWidget(widget)
         layout.addLayout(header)
         self.source_label = label('选择源视频；文件全程在本机处理。')
@@ -204,11 +207,11 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         playback.addWidget(self.play_button)
         playback.addWidget(button('一帧 ▶', lambda: self.step_frame(1)))
         playback.addWidget(button('＋ N 秒', lambda: self.skip_seconds(1)))
-        self.seek_seconds = QDoubleSpinBox()
+        self.seek_seconds = ParamControl()
         self.seek_seconds.setRange(.1, 600)
         self.seek_seconds.setValue(5)
         self.seek_seconds.setSuffix(' 秒')
-        self.seek_seconds.setMaximumWidth(100)
+        self.seek_seconds.setMaximumWidth(235)
         playback.addWidget(self.seek_seconds)
         self.reverse_button = button('按住 ◀ 3×', lambda: None)
         self.forward_button = button('按住 ▶ 3×', lambda: None)
@@ -230,7 +233,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         side_layout = QVBoxLayout(side)
         side_layout.setSpacing(9)
         title = QHBoxLayout()
-        title.addWidget(label('修订片段', 'section'))
+        title.addWidget(label('随时添加选区', 'section'))
         title.addStretch()
         self.count_label = label('0 段')
         title.addWidget(self.count_label)
@@ -242,7 +245,8 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         side_layout.addWidget(self.clip_list, 1)
         row = QHBoxLayout()
         row.addWidget(button('＋ 添加选区', self.add_selection, True))
-        remove = button('删除片段', self.delete_edit)
+        remove = button('移除选区设置', self.delete_edit)
+        remove.setToolTip('移除编辑设置。要从成片剪掉音画，请使用「直接删除段落」。')
         remove.setObjectName('danger')
         row.addWidget(remove)
         side_layout.addLayout(row)
@@ -252,39 +256,38 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         workflow.addWidget(self.new_button)
         workflow.addWidget(self.range_button)
         side_layout.addLayout(workflow)
-        self.workflow_label = label('选定片段 → 锁定长度 → 修改 → 确认退出')
+        self.workflow_label = label('在时间轴右键拖动，或输入入点和出点。')
         self.workflow_label.setWordWrap(True)
         side_layout.addWidget(self.workflow_label)
         form = QFormLayout()
         self.clip_form = form
         form.setSpacing(9)
-        self.in_time = TimeSpinBox()
-        self.out_time = TimeSpinBox()
+        self.in_time = ParamControl(time=True)
+        self.out_time = ParamControl(time=True)
         form.addRow('入点', self.in_time)
         form.addRow('出点', self.out_time)
-        self.in_time.valueChanged.connect(self.selection_inputs_changed)
-        self.out_time.valueChanged.connect(self.selection_inputs_changed)
-        self.effect = QComboBox()
+        self.in_time.valueChanged.connect(lambda _: self.selection_inputs_changed(self.in_time))
+        self.out_time.valueChanged.connect(lambda _: self.selection_inputs_changed(self.out_time))
+        self.effect = WheelSafeComboBox()
         self.effect.addItems(['全屏模糊', '区域模糊', '贴纸遮挡', '不遮挡（仅变速）'])
         self.effect.currentIndexChanged.connect(self.effect_changed)
         form.addRow('效果', self.effect)
-        self.strength = QSlider(Qt.Orientation.Horizontal)
+        self.strength = ParamControl(decimals=0)
         self.strength.setRange(1, 100)
         self.strength.setValue(20)
         self.strength.valueChanged.connect(self.form_changed)
         form.addRow('模糊强度', self.strength)
-        self.speed = QDoubleSpinBox()
+        self.speed = ParamControl()
         self.speed.setRange(.25, 4)
-        self.speed.setSingleStep(.25)
         self.speed.setSuffix(' ×')
         self.speed.setValue(1)
         self.speed.valueChanged.connect(self.form_changed)
         form.addRow('片段速度', self.speed)
-        self.shape = QComboBox()
+        self.shape = WheelSafeComboBox()
         self.shape.addItems(['方框', '圆形 / 椭圆', '套索'])
         self.shape.currentIndexChanged.connect(self.shape_changed)
         form.addRow('遮罩形状', self.shape)
-        self.feather = QDoubleSpinBox()
+        self.feather = ParamControl()
         self.feather.setRange(0, 20)
         self.feather.setSuffix(' %')
         self.feather.setToolTip('按原画短边百分比向遮罩内部羽化；0 为硬边。')
@@ -298,8 +301,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         region_layout.setContentsMargins(0, 0, 0, 0)
         self.coordinates = []
         for name, value in [('左侧 %', 25), ('顶部 %', 25), ('宽度 %', 50), ('高度 %', 50)]:
-            spin = QDoubleSpinBox()
-            spin.setDecimals(2)
+            spin = ParamControl()
             spin.setRange(0 if len(self.coordinates)<2 else .1, 100)
             spin.setValue(value)
             spin.valueChanged.connect(self.coordinate_changed)
@@ -308,12 +310,13 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         side_layout.addWidget(self.region_panel)
         self.image_button = button('导入贴纸到素材库…', self.choose_image)
         self.sticker_library_list = StickerList()
-        library = QWidget()
-        library_layout = QVBoxLayout(library)
+        self.library_dialog = QDialog(self)
+        self.library_dialog.setWindowTitle('贴纸素材 · Q-Pixelate')
+        self.library_dialog.resize(420, 440)
+        library_layout = QVBoxLayout(self.library_dialog)
         library_layout.addWidget(self.image_button)
-        library_layout.addWidget(label('从这里拖到视频画面。'))
+        library_layout.addWidget(label('选中素材后可添加贴纸，也可拖到视频画面。'))
         library_layout.addWidget(self.sticker_library_list, 1)
-        library_layout.addWidget(button('用选中贴纸框选并追踪', self.begin_sticker_tracking))
         self.layer_panel = LayerInspector()
         self.layer_tab = QWidget()
         self.layer_tab.setObjectName('layerProperties')
@@ -322,7 +325,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.layer_empty = label('先在选区轨创建或选中一个选区。')
         layer_layout.addWidget(self.layer_empty)
         layer_layout.addStretch()
-        self.sticker_combo = QComboBox()
+        self.sticker_combo = WheelSafeComboBox()
         self.sticker_combo.currentIndexChanged.connect(self.sticker_selected)
         side_layout.addWidget(self.sticker_combo)
         self.image_label = label('尚未选择贴纸')
@@ -332,24 +335,26 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         actions_layout = QVBoxLayout(actions_panel)
         actions_layout.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
-        self.confirm_button = button('确认并锁定片段', self.apply_edit, True)
-        self.unlock_button = button('解锁并编辑', self.unlock_edit)
+        self.confirm_button = button('确认修改', self.apply_edit, True)
+        self.unlock_button = button('解锁旧片段', self.unlock_edit)
         row.addWidget(self.confirm_button)
         row.addWidget(self.unlock_button)
         actions_layout.addLayout(row)
-        actions_layout.addWidget(button('预览当前片段效果', self.preview_edit))
+        row = QHBoxLayout()
+        self.preview_selection_button = button('预览所选片段', self.preview_edit)
+        row.addWidget(self.preview_selection_button)
+        row.addWidget(button('预览成片', self.preview_project))
+        actions_layout.addLayout(row)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(side)
-        layer_properties = QScrollArea()
-        layer_properties.setWidgetResizable(True)
-        layer_properties.setWidget(self.layer_tab)
+        self.layer_properties_tab = QScrollArea()
+        self.layer_properties_tab.setWidgetResizable(True)
+        self.layer_properties_tab.setWidget(self.layer_tab)
         self.editor_tabs = QTabWidget()
-        self.editor_tabs.addTab(scroll, '选区')
-        self.editor_tabs.addTab(library, '贴纸素材')
-        self.editor_tabs.addTab(layer_properties, '图层属性')
-        self.editor_tabs.setCurrentWidget(library)
-        self.setup_detection_tab()
+        self.editor_tabs.addTab(scroll, '选择区间')
+        self.editor_tabs.addTab(self.setup_effects_tab(), '添加效果')
+        self.editor_tabs.addTab(self.layer_properties_tab, '图层属性')
         editor_panel = QWidget()
         editor_panel.setMinimumWidth(375)
         editor_layout = QVBoxLayout(editor_panel)
@@ -360,16 +365,16 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         splitter.setSizes([950, 380])
         timeline_header = QHBoxLayout()
         timeline_header.addWidget(label('源视频时间轴', 'section'))
-        timeline_header.addWidget(label('  I / O 设入出点 · 空格播放 / 暂停'))
+        timeline_header.addWidget(label('  I / O 设入出点 · Ctrl+L 锁定长度 · 空格播放 / 暂停'))
         timeline_header.addStretch()
         self.in_button = button('设为入点 I', self.set_in)
         self.out_button = button('设为出点 O', self.set_out)
         timeline_header.addWidget(self.in_button)
         timeline_header.addWidget(self.out_button)
         timeline_header.addWidget(label('缩放'))
-        self.zoom = QSlider(Qt.Orientation.Horizontal)
+        self.zoom = ParamControl()
         self.zoom.setRange(1, 100)
-        self.zoom.setMaximumWidth(130)
+        self.zoom.setMaximumWidth(240)
         timeline_header.addWidget(self.zoom)
         body.addLayout(timeline_header)
         self.timeline = Timeline()
@@ -434,12 +439,102 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.update_edit_controls()
         self.update_enabled()
 
+    def setup_effects_tab(self):
+        self.effects_tab = QScrollArea()
+        self.effects_tab.setWidgetResizable(True)
+        effects = QWidget()
+        effects.setObjectName('effectsPanel')
+        self.effects_tab.setWidget(effects)
+        layout = QVBoxLayout(effects)
+        layout.addWidget(label('画面效果', 'section'))
+        static = button('普通静态贴纸', self.add_static_effect)
+        masked = button('模糊遮罩层', lambda: self.begin_mask(False, shape=shape.currentData()))
+        shape = WheelSafeComboBox()
+        for title, value in (('方框', 'rect'), ('椭圆', 'ellipse'), ('套索', 'lasso')):
+            shape.addItem(title, value)
+        self.track_sticker_button = button('追踪贴纸', self.add_tracking_sticker_effect)
+        track_blur = button('追踪模糊遮罩层', self.begin_blur_tracking)
+        full = button('全屏模糊', self.add_full_blur_effect)
+        self.auto_effect_button = button('自动打码', self.show_auto_mosaic)
+        self.auto_effect_button.setCheckable(True)
+        for left, right in ((static, self.track_sticker_button), (full, self.auto_effect_button)):
+            row = QHBoxLayout()
+            row.addWidget(left, 1)
+            row.addWidget(right, 1)
+            layout.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(masked, 1)
+        row.addWidget(shape)
+        row.addWidget(track_blur, 1)
+        layout.addLayout(row)
+        layout.addWidget(label('段落效果', 'section'))
+        omit = button('直接删除段落', lambda: self.add_paragraph_effect('omit'))
+        omit.setToolTip('预览和导出时跳过整段音画。可在图层属性撤销。')
+        speed = button('倍速段落', lambda: self.add_paragraph_effect('speed'))
+        row = QHBoxLayout()
+        row.addWidget(omit, 1)
+        row.addWidget(speed, 1)
+        layout.addLayout(row)
+        self.setup_detection_panel()
+        layout.addWidget(self.detection_tab)
+        self.detection_tab.hide()
+        layout.addStretch()
+        self.effect_buttons = (static, masked, shape, self.track_sticker_button, track_blur, full,
+                               self.auto_effect_button, omit, speed)
+        self.editor_tabs.currentChanged.connect(lambda _: self.update_canvas_mask())
+        return self.effects_tab
+
+    def show_auto_mosaic(self, visible=True):
+        self.auto_effect_button.setChecked(visible)
+        self.detection_tab.setVisible(visible)
+        if visible:
+            self.editor_tabs.setCurrentWidget(self.effects_tab)
+        self.sync_detection()
+
+    def show_sticker_library(self):
+        self.library_dialog.show()
+        self.library_dialog.raise_()
+        self.library_dialog.activateWindow()
+
+    def add_static_effect(self):
+        item = self.sticker_library_list.currentItem()
+        if item is None:
+            self.status.setText('请在贴纸素材库选中图片，再添加静态贴纸。')
+            self.show_sticker_library()
+        elif self.add_static_sticker(item.data(self.sticker_library_list.asset_role), QPointF(.5, .5)):
+            self.editor_tabs.setCurrentWidget(self.layer_properties_tab)
+
+    def add_tracking_sticker_effect(self):
+        self.begin_sticker_tracking()
+        if self._tracking_request is None and self.sticker_library_list.currentItem() is None:
+            self.show_sticker_library()
+
+    def add_full_blur_effect(self):
+        self.add_full_blur()
+        self.editor_tabs.setCurrentWidget(self.layer_properties_tab)
+
+    def add_paragraph_effect(self, kind):
+        edit = self.promote_selected_edit()
+        if not edit or edit.locked:
+            return
+        self.cancel_layer_interaction()
+        if kind == 'omit':
+            if not edit.omit:
+                self.store_layer_edit(replace(edit, omit=True))
+            self.status.setText('预览和导出将跳过当前选区。移除「直接删除段落」效果可恢复。')
+        elif not edit.speed_effect:
+            self.store_layer_edit(replace(edit, speed_effect=True, speed=edit.speed if edit.speed != 1 else 2))
+        self.select_effect_layer('@omit' if kind == 'omit' else '@speed')
+        self.editor_tabs.setCurrentWidget(self.layer_properties_tab)
+
     def update_enabled(self):
         busy = self.worker is not None and self.worker.isRunning()
         self.body.setEnabled(not busy and self.project is not None)
         self.open_button.setEnabled(not busy)
         self.load_button.setEnabled(not busy)
         self.settings_button.setEnabled(not busy)
+        self.library_button.setEnabled(not busy)
+        self.library_dialog.setEnabled(not busy)
         self.save_button.setEnabled(not busy and self.project is not None)
         self.export_button.setEnabled(not busy and self.project is not None)
         self.cancel_button.setVisible(busy)
@@ -590,6 +685,8 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             info = probe(project.source, runner)
             for edit in project.edits:
                 edit.promote_layers(info.width, info.height)
+                edit.range_locked |= edit.locked
+                edit.locked = False
             return project, info
         def done(result):
             self.set_project(*result)
@@ -658,13 +755,20 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.timeline.update()
         self.form_changed()
 
-    def selection_inputs_changed(self):
+    def selection_inputs_changed(self, control):
         if self._range_locked and not self._loading_form:
             blockers = [QSignalBlocker(self.in_time), QSignalBlocker(self.out_time)]
             self.in_time.setValue(self.timeline.selection[0])
             self.out_time.setValue(self.timeline.selection[1])
             return
-        start, end = self.in_time.value(), self.out_time.value()
+        value = control.value()
+        if self.info and value == control.maximum():
+            value = self.info.duration
+        start, end = self.timeline.selection
+        if control is self.in_time:
+            start = value
+        else:
+            end = value
         if self.layer_edit() is not None:
             if (end-start < self.timeline.minimum_span-.0005 or any(
                     index != self._editing_row and start < edit.end-1e-8 and end > edit.start+1e-8
@@ -682,12 +786,12 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         row = self._editing_row
         base = self._drafts.get(row, self.project.edits[row]) if self.project and 0 <= row < len(self.project.edits) else None
         locked = bool(base and base.locked)
+        start, end = self.timeline.selection
         if base and base.layers is not None:
-            start, end = self.timeline.selection
             delta = base.start-start
             layers = [replace(layer, start=layer.start+delta, end=layer.end+delta) for layer in base.layers] if delta else base.layers
-            return replace(base, start=start, end=end, speed=self.speed.value(), range_locked=self._range_locked, layers=layers)
-        return Edit(self.in_time.value(), self.out_time.value(), ['blur', 'region', 'image', 'none'][self.effect.currentIndex()],
+            return replace(base, start=start, end=end, range_locked=self._range_locked, layers=layers)
+        return Edit(start, end, ['blur', 'region', 'image', 'none'][self.effect.currentIndex()],
                     Rect(*(s.value()/100 for s in self.coordinates)), self.strength.value(), self.image_path,
                     self.speed.value(), ['rect', 'ellipse', 'lasso'][self.shape.currentIndex()],
                     list(self.mask_points), self.feather.value(), self._range_locked, locked)
@@ -774,11 +878,12 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             self.status.setText('请先添加片段或在列表中选择要修改的片段。')
             return False
         if self.project.edits[row].locked:
-            self.status.setText('片段已锁定；请先点击“解锁并编辑”。')
+            self.status.setText('请先点击「解锁旧片段」。')
             return False
         edit = self.current_edit()
-        edit.locked = True
-        edit.range_locked = True
+        if edit.layers is None:
+            edit.locked = True
+            edit.range_locked = True
         try:
             edit.validate(self.info.duration)
             if any(index != row and edit.start < other.end-1e-8 and edit.end > other.start+1e-8
@@ -789,9 +894,12 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             return False
         self.project.edits[row] = edit
         self._drafts.pop(row, None)
-        self.refresh_edits(row)
+        self._range_locked = edit.range_locked
+        self.timeline.edits[row] = edit
+        self.clip_list.item(row).setText(self.edit_caption(row, edit))
+        self.update_edit_controls()
         self.changed()
-        self.status.setText('修改已确认，已退出编辑并锁定片段。')
+        self.status.setText('修改已确认。')
         return True
 
     def commit_form(self):
@@ -822,9 +930,12 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
     def edit_caption(self, row, edit):
         names = {'blur': '全屏模糊', 'region': '区域模糊', 'image': '贴纸遮挡', 'none': '仅变速'}
         summary = names[edit.effect] if edit.layers is None else f'{len(edit.layers)} 个图层'
+        if edit.omit:
+            summary = '跳过整段 · ' + summary
+        lock = '长度已锁定' if edit.range_locked or edit.locked else '长度可调整'
         pending = ' *' if row in self._drafts else ''
         return (f'{row+1:02}{pending}  {time_text(edit.start)} → {time_text(edit.end)}\n'
-                f'      {summary} · {edit.speed:g}× · {"已锁定" if edit.locked else "编辑中"}')
+                f'      {summary} · {edit.speed:g}× · {lock}')
 
     def select_edit(self, row, keep_draft=False):
         if not self.project or row < 0 or row >= len(self.project.edits):
@@ -845,6 +956,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         if previous != row or edit.locked:
             self.cancel_layer_interaction()
             self._layer_id = edit.layers[0].id if edit.layers else None
+            self.reset_layer_selection()
             self._layer_target = 'mask' if edit.layers and edit.layers[0].kind == 'blur' else 'sticker'
         self._editing_row = row
         self.timeline.active_row = row
@@ -961,19 +1073,26 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
 
     def update_edit_controls(self):
         locked = self.selected_locked()
+        selected = self._editing_row >= 0
         layered = self.layer_edit() is not None
         legacy = self._editing_row >= 0 and not layered
         self.timeline.selection_locked = self._range_locked or locked
         for widget in (self.in_time, self.out_time, self.in_button, self.out_button):
             widget.setEnabled(not self.timeline.selection_locked)
-        self.range_button.setEnabled(not locked)
+        self.range_button.setEnabled(selected and not locked)
         self.range_button.setText('解锁片段长度' if self._range_locked else '锁定片段长度')
+        self.range_button.setToolTip('Ctrl+L · 仅固定当前选区的入点和出点')
         self.confirm_button.setEnabled(not locked and self._editing_row >= 0 and (layered or self._range_locked))
         self.unlock_button.setEnabled(locked)
+        self.unlock_button.setVisible(locked)
+        self.preview_selection_button.setEnabled(selected)
+        for widget in self.effect_buttons:
+            widget.setEnabled(selected and not locked)
         editable = not locked and self._range_locked
         index = self.effect.currentIndex()
         for widget in (self.effect, self.strength, self.shape, self.feather, self.redraw_button):
             self.clip_form.setRowVisible(widget, legacy)
+        self.clip_form.setRowVisible(self.speed, legacy)
         self.effect.setEnabled(editable)
         self.speed.setEnabled(not locked and (layered or editable))
         self.strength.setEnabled(editable and index in (0, 1))
@@ -986,23 +1105,27 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.sticker_combo.setVisible(legacy and index == 2)
         self.image_label.setVisible(legacy and index == 2)
         self.sticker_combo.setEnabled(editable)
-        self.workflow_label.setText('片段已确认并锁定 · 需要修改时先解锁' if locked else
-                                    '编辑图层后可确认并锁定' if layered else
-                                    '长度已锁定 → 修改 → 确认并锁定片段' if self._range_locked else
-                                    '在选区轨右键拖动，或输入入点和出点后添加选区')
+        self.workflow_label.setText('解锁旧片段后可编辑。' if locked else
+                                    '长度已锁定，仍可添加和编辑效果。' if self._range_locked else
+                                    '在选区轨右键拖动，或输入入点和出点后添加选区。')
         self.timeline.update()
         self.sync_layer_editor()
         self.sync_detection()
 
     def toggle_range_lock(self):
-        if self.selected_locked():
+        if self._editing_row < 0 or self.selected_locked():
             return
-        if self.in_time.value() >= self.out_time.value():
+        if not self._range_locked:
+            for control in (self.in_time, self.out_time):
+                if control.editor.isModified():
+                    control.interpretText()
+        start, end = self.timeline.selection
+        if start >= end:
             self.status.setText('请先选择有效的片段范围。')
             return
         self._range_locked = not self._range_locked
-        self.update_edit_controls()
         self.form_changed()
+        self.update_edit_controls()
 
     def unlock_edit(self):
         if self.selected_locked():
@@ -1019,6 +1142,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self._editing_row = -1
         self.cancel_layer_interaction()
         self._layer_id = None
+        self.reset_layer_selection()
         self.timeline.active_row = -1
         self._range_locked = False
         self._loading_form = True
@@ -1172,6 +1296,10 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.canvas.update()
 
     def sync_scrollbar(self, start):
+        zoom = round(self.timeline.zoom, 2)
+        if self.zoom.value() != zoom:
+            with QSignalBlocker(self.zoom):
+                self.zoom.setValue(zoom)
         blocker = QSignalBlocker(self.scrollbar)
         available = max(0, self.timeline.duration-self.timeline.visible)
         self.scrollbar.setRange(0, 10000 if available > .000001 else 0)
@@ -1187,25 +1315,37 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.layer_timeline.update()
 
     def preview_edit(self):
-        row = self.clip_list.currentRow()
-        if not self.project or row < 0:
+        if self._editing_row < 0:
             self.status.setText('请先添加并选择一个修订片段。')
             return
+        self.start_preview(self._editing_row)
+
+    def preview_project(self):
+        self.start_preview()
+
+    def start_preview(self, row=None):
+        if not self.project:
+            return
+        from .render import render_project_preview
+
+        self.stash_edit()
         project = copy.deepcopy(Project(self.project.source, self.timeline.edits, self.project.fingerprint))
-        if not project.edits[row].locked:
-            project.edits[row] = self.current_edit()
         try:
             project.validate(self.info.duration)
         except ValueError as exc:
             self.error(str(exc))
             return
+        self.player.pause()
         path = Path(self.preview_temp.name) / f'preview-{len(self.preview_dialogs)}.mp4'
         def done(result):
-            dialog = PreviewDialog(result, self)
+            dialog = PreviewDialog(result, self, whole=row is None)
             self.preview_dialogs.append(dialog)
             dialog.show()
             self.status.setText('真实效果预览已生成；参数修改后请重新预览。')
-        self.start_job(lambda runner: render_preview(project, row, path, runner), done)
+        if row is None:
+            self.start_job(lambda runner: render_project_preview(project, path, runner), done)
+        else:
+            self.start_job(lambda runner: render_preview(project, row, path, runner), done)
 
     def choose_export(self):
         if not self.project:
@@ -1255,6 +1395,10 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             return True
         focus = QApplication.focusWidget()
         if event.type() == QEvent.Type.KeyPress:
+            if key == Qt.Key_L and event.modifiers() == Qt.ControlModifier:
+                if not event.isAutoRepeat():
+                    self.toggle_range_lock()
+                return True
             if key == Qt.Key_T and event.modifiers() == Qt.ControlModifier and self.begin_transform():
                 return True
             if focus is self.canvas and key == Qt.Key_Escape and self.canvas.mask_shape is not None:
@@ -1270,7 +1414,8 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
                         geometry_focus.interpretText()
                     self.finish_transform(key == Qt.Key_Escape)
                     return True
-        if isinstance(focus, (QLineEdit, QAbstractSpinBox, QTextEdit, QComboBox)):
+        if isinstance(focus, (QLineEdit, QAbstractSpinBox, QTextEdit, QComboBox, ParamControl)) or (
+                focus and isinstance(focus.parentWidget(), ParamControl)):
             return False
         if key not in (Qt.Key_Space, Qt.Key_Left, Qt.Key_Right, Qt.Key_I, Qt.Key_O, Qt.Key_Delete):
             return False
@@ -1326,6 +1471,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             return
         self.player.stop()
         self.player.setSource(QUrl())
+        self.library_dialog.close()
         for dialog in self.preview_dialogs:
             dialog.close()
         self.preview_temp.cleanup()

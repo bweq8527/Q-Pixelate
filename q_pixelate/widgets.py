@@ -160,6 +160,13 @@ class VideoCanvas(QWidget):
             elif layer.kind == 'mosaic':
                 rect = layer.mosaic_rect_at(self.layer_source_time-layer.start)
                 self.paint_detection_box(painter, box, rect)
+            elif layer.kind == 'blur' and layer.motion:
+                rect = layer.mosaic_rect_at(self.layer_source_time-layer.start)
+                area = QRectF(box.x()+rect.x*box.width(), box.y()+rect.y*box.height(),
+                              rect.w*box.width(), rect.h*box.height()).intersected(box)
+                painter.fillRect(area, QColor(94, 196, 175, 30))
+                painter.setPen(QPen(QColor('#6ee7c0'), 1, Qt.PenStyle.DashLine))
+                painter.drawRect(area)
             elif layer.mask:
                 painter.save()
                 painter.setClipRect(box)
@@ -496,7 +503,8 @@ class Timeline(QWidget):
         p.setClipRect(19, 42, self.width()-38, 62)
         for edit in self.edits:
             x1, x2 = self.point_for_time(edit.start).x(), self.point_for_time(edit.end).x()
-            color = QColor('#415568') if edit.locked else QColor('#296f69') if edit.effect != 'image' else QColor('#7460a0')
+            color = QColor('#815054') if edit.omit else QColor('#415568') if edit.locked else (
+                QColor('#296f69') if edit.effect != 'image' else QColor('#7460a0'))
             p.fillRect(QRectF(x1, 58, max(2, x2-x1), 34), color)
         left, right = (self.point_for_time(t).x() for t in (self.candidate or self.selection))
         p.fillRect(QRectF(left, 60, max(0, right-left), 42), QColor(110, 231, 192, 28))

@@ -58,13 +58,16 @@ def require_idr(info, frame, runner):
 
 def effect_intervals(edits):
     for edit in edits:
+        if edit.omit:
+            continue
         if edit.layers is None:
             yield edit, None
             continue
         for layer in edit.layers:
             start, end = edit.layer_span(layer)
             if start < end:
-                effect = {'sticker': 'image', 'mosaic': 'mosaic'}.get(layer.kind, 'region' if layer.mask else 'blur')
+                effect = {'sticker': 'image', 'mosaic': 'mosaic'}.get(
+                    layer.kind, 'tracked_blur' if layer.motion else 'region' if layer.mask else 'blur')
                 yield replace(edit, start=start, end=end, effect=effect, strength=layer.strength,
                               feather=layer.mask.feather if layer.mask else 0), layer
 
@@ -72,7 +75,7 @@ def effect_intervals(edits):
 def encoding_intervals(edits, fps):
     # Legacy projects retain their existing spans. Layered projects only encode
     # the GOPs containing an actual effect or a speed change.
-    intervals = [edit for edit in edits if edit.layers is None or edit.speed != 1]
+    intervals = [edit for edit in edits if edit.layers is None or edit.speed != 1 or edit.omit]
     intervals.extend(edit for edit, layer in effect_intervals(edits)
                      if layer is not None and frame_bounds(edit, fps)[0] < frame_bounds(edit, fps)[1])
     return intervals
@@ -89,19 +92,22 @@ def sample_aspect(info):
 def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed=1,
                  *, stop=None, pixel_aspect=1, runner=None):
     """Stage assets under safe names; user paths never appear inside filter syntax."""
-    graph = ['[0:v:0]setpts=PTS-STARTPTS[v0]']
     inputs = []
     image_index = 0
     offset_frame = round(offset * fps)
-    effects = [(edit, layer) for edit, layer in effect_intervals(edits)
-               if edit.end > offset and (stop is None or edit.start < stop)]
+    stop_frame = round(stop * fps) if stop is not None else None
+    effects = []
+    for edit, layer in effect_intervals(edits):
+        first, last = frame_bounds(edit, fps)
+        if first < last and last > offset_frame and (stop_frame is None or first < stop_frame):
+            effects.append((edit, layer))
     groups = [list(group) for _, group in groupby(effects, lambda pair: (
         ('mosaic', pair[0].strength) if pair[0].effect == 'mosaic' else object()))]
     rate = Fraction(fps).limit_denominator(1_000_000)
     frame_pts = f'settb={rate.denominator}/{rate.numerator},setpts=N'
     has_motion = any(layer is not None and layer.motion for _, layer in effects)
-    if has_motion:
-        graph[0] = f'[0:v:0]{frame_pts}[v0]'
+    trim = f'trim=end_frame={stop_frame-offset_frame},' if stop_frame is not None else ''
+    graph = [f'[0:v:0]{trim}{frame_pts if has_motion else "setpts=PTS-STARTPTS"}[v0]']
 
     def add_input(asset, *, loop=True):
         nonlocal image_index
@@ -132,21 +138,25 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
         first, last = frame_bounds(edit, fps)
         enable = f"gte(n,{first-offset_frame})*lt(n,{last-offset_frame})"
         radius = max(1, min(edit.strength, width // 4, height // 4))
-        if edit.effect == 'mosaic':
+        if edit.effect in ('mosaic', 'tracked_blur'):
             if stop is None or runner is None:
-                raise ValueError('马赛克渲染需要明确的帧范围。')
-            asset = workspace / f'mosaic-{i}.nut'
+                raise ValueError('追踪遮罩渲染需要明确的帧范围。')
+            asset = workspace / f'coverage-{i}.nut'
             chunks = mask_frames(group, width, height, offset_frame, round(stop*fps), fps)
             runner.run(FFMPEG + ['-f', 'rawvideo', '-pixel_format', 'gray',
                                  '-video_size', f'{width}x{height}', '-framerate', str(rate),
                                  '-i', 'pipe:0', '-c:v', 'ffv1', '-f', 'nut', str(asset)], input_chunks=chunks)
             index = add_input(asset, loop=False)
-            block = edit.strength
+            if edit.effect == 'mosaic':
+                block = edit.strength
+                effect = (f'scale={max(1, math.ceil(width/block))}:{max(1, math.ceil(height/block))}:flags=area,'
+                          f'scale={width}:{height}:flags=neighbor,setsar={Fraction(pixel_aspect).limit_denominator()}')
+            else:
+                effect = f'boxblur={radius}:2'
             graph.extend([f'[{index}:v]{frame_pts},format=gbrp[coverage{i}]',
                           f'[{before}]format=gbrp,split[base{i}][pixels{i}]',
-                          f'[pixels{i}]scale={max(1, math.ceil(width/block))}:{max(1, math.ceil(height/block))}:flags=area,'
-                          f'scale={width}:{height}:flags=neighbor,setsar={Fraction(pixel_aspect).limit_denominator()}[blocks{i}]',
-                          f'[base{i}][blocks{i}][coverage{i}]maskedmerge[{after}]'])
+                          f'[pixels{i}]{effect}[changed{i}]',
+                          f'[base{i}][changed{i}][coverage{i}]maskedmerge[{after}]'])
         elif edit.effect == 'blur':
             graph.append(f"[{before}]boxblur=luma_radius={radius}:luma_power=2:chroma_radius={max(1, radius//2)}:enable='{enable}'[{after}]")
         elif edit.effect == 'region':
@@ -211,17 +221,19 @@ def effect_graph(edits, width, height, offset, workspace, fps, scale=None, speed
 
 
 def speed_sections(edits, start, end, fps):
+    """Plan retained source-frame runs and their output speeds."""
     cuts = {start, end}
     speeds = []
     for edit in edits:
-        if edit.speed != 1:
+        if edit.omit or edit.speed != 1:
             a, b = frame_bounds(edit, fps)
             if a < end and b > start:
                 cuts.update((max(a, start), min(b, end)))
-                speeds.append((a, b, edit.speed))
+                speeds.append((a, b, None if edit.omit else edit.speed))
     cuts = sorted(cuts)
-    return [(a, b, next((s for x, y, s in speeds if x <= a < y), 1))
-            for a, b in zip(cuts, cuts[1:])]
+    sections = [(a, b, next((s for x, y, s in speeds if x <= a < y), 1))
+                for a, b in zip(cuts, cuts[1:])]
+    return [(a, b, speed) for a, b, speed in sections if speed is not None]
 
 
 def output_frames(start, end, speed):
@@ -246,17 +258,38 @@ def audio_graph(info, edits, start, end, input_index):
         labels = ''.join(f'[a{track}s{i}]' for i in range(len(sections)))
         # Keep delayed tracks aligned with video; STARTPTS alone would pull their
         # first audible sample to zero and permanently lose the initial silence.
-        graph.append(f'[{input_index}:a:{track}]aresample=async=1:first_pts=0,asplit={len(sections)}{labels}')
+        graph.append(f'[{input_index}:a:{track}]aresample=async=1:first_pts=0,'
+                     f'apad=whole_dur={end/info.fps_float:.12f},asplit={len(sections)}{labels}')
         for i, (a, b, speed) in enumerate(sections):
             count = output_frames(a, b, speed)
             duration = count/info.fps_float
             effective = (b-a)/count
+            tempo = f',{tempo_chain(effective)}' if effective != 1 else ''
             graph.append(f'[a{track}s{i}]atrim=start={a/info.fps_float:.12f}:end={b/info.fps_float:.12f},'
-                         f'asetpts=PTS-STARTPTS,{tempo_chain(effective)},apad,atrim=duration={duration:.12f}[a{track}p{i}]')
+                         f'asetpts=PTS-STARTPTS{tempo},apad,atrim=duration={duration:.12f}[a{track}p{i}]')
         graph.append(''.join(f'[a{track}p{i}]' for i in range(len(sections)))+
                      f'concat=n={len(sections)}:v=0:a=1[aout{track}]')
         maps += ['-map', f'[aout{track}]']
     return ';'.join(graph), maps
+
+
+def edited_audio_options(info, edits, start, end, input_index):
+    if not info.audio:
+        return []
+    graph, maps = audio_graph(info, edits, start, end, input_index)
+    options = ['-filter_complex', graph] + maps + ['-c:a', 'aac', '-b:a', '192k']
+    for track, metadata in enumerate(info.audio):
+        for key, value in metadata.get('tags', {}).items():
+            if key.lower() in ('language', 'title'):
+                options += [f'-metadata:s:a:{track}', f'{key}={value}']
+    return options
+
+
+def write_concat(path, files):
+    # Use absolute file URLs to prevent concat resolving # in a parent path.
+    path.write_text('ffconcat version 1.0\n' + ''.join(
+        "file 'file:" + target.as_posix().replace("'", "'\\''") + f"'\nduration {duration:.12f}\n"
+        for target, duration in files), encoding='utf-8')
 
 
 def _encoder(info):
@@ -297,7 +330,9 @@ class Exporter:
         if intervals and info.fast_mode_error():
             raise ValueError(info.fast_mode_error())
         # Only preserve tracks the destination container can hold without transcoding.
-        if destination.suffix.lower() == '.mp4' and any(a.get('codec_name') not in ('aac', 'mp3', 'ac3', 'eac3', 'alac') for a in info.audio):
+        retimed = any(e.omit or e.speed != 1 for e in project.edits)
+        if (not retimed and destination.suffix.lower() == '.mp4'
+                and any(a.get('codec_name') not in ('aac', 'mp3', 'ac3', 'eac3', 'alac') for a in info.audio)):
             raise ValueError('MP4 不能直接保留该音轨编码，请选择 MKV 输出。')
         if shutil.disk_usage(destination.parent).free < Path(project.source).stat().st_size * 2.2:
             raise ValueError('输出磁盘空间不足；请预留至少约源视频 2.2 倍空间。')
@@ -310,15 +345,19 @@ class Exporter:
                                     '-c', 'copy', '-avoid_negative_ts', 'disabled', '-progress', 'pipe:1', str(pending)], info.duration, 10, 85)
                 frame_count = int(info.video.get('nb_frames', 0))
                 encoded = 0
+                copied = info.duration
             else:
                 index = index_video(info, runner)
                 spans = plan_ranges(intervals, index.keyframes, index.frames, info.fps_float)
-                for span in spans:
-                    require_idr(info, span.start, runner)
-                encoded = sum(s.end-s.start for s in spans if s.encode) / info.fps_float
-                retimed = any(e.speed != 1 for e in project.edits)
                 pieces = [(a, b, speed, span.encode) for span in spans
                           for a, b, speed in speed_sections(project.edits, span.start, span.end, info.fps_float)]
+                if not pieces:
+                    raise ValueError('全部视频帧已设为删除，没有保留内容可导出。')
+                for span in spans:
+                    require_idr(info, span.start, runner)
+                encoded = sum(b-a for a, b, _, encode in pieces if encode) / info.fps_float
+                copied = sum(b-a for a, b, _, encode in pieces if not encode) / info.fps_float
+                retained_frames = sum(b-a for a, b, _, _ in pieces)
                 expected_frames = sum(output_frames(a, b, speed) for a, b, speed, _ in pieces)
                 runner.log(f'计划：总帧数 {index.frames}，局部重编码 {encoded:.3f}s，其余直接复制。')
                 files = []
@@ -330,7 +369,7 @@ class Exporter:
                     duration = result_count / info.fps_float
                     start = first / info.fps_float
                     target = work / f'part-{i:04d}.ts'
-                    base, weight = 5 + 75 * processed / index.frames, 75 * count / index.frames
+                    base, weight = 5 + 75 * processed / retained_frames, 75 * count / retained_frames
                     runner.report(base, f'{"局部编码" if encode else "直接复制"} {i+1}/{len(pieces)} · {start:.2f}–{last/info.fps_float:.2f}s')
                     args = FFMPEG + ['-seek_timestamp', '1', '-ss', f'{start:.9f}', '-i', info.path]
                     if encode:
@@ -349,22 +388,23 @@ class Exporter:
                     args += ['-an', '-frames:v', str(result_count), '-mpegts_flags', '+resend_headers',
                              '-muxdelay', '0', '-progress', 'pipe:1', '-f', 'mpegts', str(target)]
                     runner.run(args, duration, base, weight)
-                    # Absolute file URLs bypass concat's URL resolution of # in a parent path.
-                    files.append(('file:' + target.as_posix(), duration))
+                    files.append((target, duration))
                     processed += count
                 listing = work / 'parts.ffconcat'
-                listing.write_text('ffconcat version 1.0\n' + ''.join(
-                    "file '" + name.replace("'", "'\\''") + f"'\nduration {duration:.12f}\n" for name, duration in files), encoding='utf-8')
-                runner.report(82, '正在拼接视频并保留原始完整音轨…')
+                write_concat(listing, files)
+                runner.report(82, '正在拼接视频与音轨…' if retimed else '正在拼接视频并保留原始完整音轨…')
                 args = FFMPEG + ['-f', 'concat', '-safe', '0', '-i', str(listing), '-i', info.path,
                                  '-map', '0:v:0', '-map_metadata', '1', '-c:v', 'copy', '-avoid_negative_ts', 'disabled']
-                if retimed and info.audio:
-                    graph, maps = audio_graph(info, project.edits, 0, index.frames, 1)
-                    args += ['-filter_complex', graph] + maps + ['-c:a', 'aac', '-b:a', '192k']
-                    for track, metadata in enumerate(info.audio):
-                        for key, value in metadata.get('tags', {}).items():
-                            if key.lower() in ('language', 'title'):
-                                args += [f'-metadata:s:a:{track}', f'{key}={value}']
+                if retimed:
+                    args += edited_audio_options(info, project.edits, 0, index.frames, 1)
+                    delay = int(info.video.get('has_b_frames', 0))
+                    if delay:
+                        # Very short pieces may have no B-frames even when the
+                        # surrounding GOPs do. Use a common decode delay so the
+                        # concatenated stream retains monotonic decode timestamps.
+                        tick = f'({info.fps.denominator}/{info.fps.numerator}/TB)'
+                        args += ['-bsf:v', f'setts=pts=PTS:dts=STARTPTS+round((N-{delay})*{tick}):'
+                                           f'duration=round((N+1)*{tick})-round(N*{tick})']
                 else:
                     args += ['-map', '1:a?', '-c:a', 'copy']
                 if destination.suffix.lower() == '.mp4':
@@ -396,7 +436,7 @@ class Exporter:
                 raise ValueError('输出文件已被其他程序创建，请选择新路径。')
             os.replace(pending, destination)
             runner.report(100, '导出完成')
-            return ExportReport(str(destination), encoded, info.duration-encoded, frame_count, len(info.audio))
+            return ExportReport(str(destination), encoded, copied, frame_count, len(info.audio))
 
 
 def render_preview(project: Project, edit_index: int, destination, runner: Runner):
@@ -408,6 +448,15 @@ def render_preview(project: Project, edit_index: int, destination, runner: Runne
     first, last = frame_bounds(edit, info.fps_float)
     if first >= last:
         raise ValueError('片段没有覆盖任何视频帧，请扩大时间范围。')
+    if edit.omit:
+        index = index_video(info, runner)
+        retained = speed_sections(project.edits, 0, index.frames, info.fps_float)
+        before = max((b for _, b, _ in retained if b <= first), default=None)
+        after = min((a for a, _, _ in retained if a >= last), default=None)
+        context = max(1, round(info.fps_float))
+        start = first if before is None else max(0, before-context)
+        end = last if after is None else min(index.frames, after+context)
+        return _render_preview_range(project, info, start, min(end, index.frames), destination, runner)
     start, duration = first/info.fps_float, (last-first)/info.fps_float
     with tempfile.TemporaryDirectory(prefix='qpixel-preview-') as directory:
         count = output_frames(first, last, edit.speed)
@@ -417,7 +466,6 @@ def render_preview(project: Project, edit_index: int, destination, runner: Runne
         audio_maps = ['-map', '0:a?']
         if edit.speed != 1 and info.audio:
             # Input seek resets timestamps; express the preview edit on that local timeline.
-            from dataclasses import replace
             audio, audio_maps = audio_graph(info, [replace(edit, start=0, end=duration)], 0, last-first, 0)
             graph += ';' + audio
         duration = count/info.fps_float
@@ -426,4 +474,61 @@ def render_preview(project: Project, edit_index: int, destination, runner: Runne
                    ['-filter_complex', graph, '-map', '[out]'] + audio_maps + ['-t', f'{duration:.9f}', '-frames:v', str(count),
                     '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-pix_fmt', 'yuv420p',
                     '-c:a', 'aac', '-progress', 'pipe:1', str(destination)], duration, 1, 98)
+    return str(destination)
+
+
+def render_project_preview(project: Project, destination, runner: Runner):
+    project.check_source()
+    info = probe(project.source, runner)
+    project.validate(info.duration)
+    index = index_video(info, runner)
+    return _render_preview_range(project, info, 0, index.frames, destination, runner)
+
+
+def _render_preview_range(project, info, start, end, destination, runner):
+    destination = Path(destination).resolve()
+    if destination in project.asset_paths():
+        raise ValueError('预览不能覆盖源视频或遮挡素材。')
+    fps = info.fps_float
+    kept = speed_sections(project.edits, start, end, fps)
+    if not kept:
+        raise ValueError('全部视频帧已设为删除，没有保留内容可预览。')
+    # Materialize per-frame coverage only where an effect is active. Keep a
+    # retimed run intact so the audio and video round its duration together.
+    motion_edges = sorted({frame for edit, layer in effect_intervals(project.edits) if layer and layer.motion
+                           for frame in frame_bounds(edit, fps)})
+    sections = []
+    for first, last, speed in kept:
+        cuts = [first, *(f for f in motion_edges if speed == 1 and first < f < last), last]
+        sections.extend((a, b, speed) for a, b in zip(cuts, cuts[1:]))
+    with tempfile.TemporaryDirectory(prefix='qpixel-preview-', dir=destination.parent) as directory:
+        work = Path(directory)
+        files = []
+        retained = sum(b-a for a, b, _ in sections)
+        rendered = 0
+        for i, (first, last, speed) in enumerate(sections):
+            runner.check()
+            count = output_frames(first, last, speed)
+            offset, duration = first/fps, count/fps
+            target = work / f'part-{i:04d}.mp4'
+            inputs, graph = effect_graph(project.edits, info.width, info.height, offset, work, fps, 960,
+                                         (last-first)/count, stop=last/fps, pixel_aspect=sample_aspect(info), runner=runner)
+            progress, weight = 5 + 85*rendered/retained, 85*(last-first)/retained
+            runner.report(progress, f'正在生成真实效果预览 {i+1}/{len(sections)}…')
+            args = FFMPEG + ['-seek_timestamp', '1', '-ss', f'{offset:.9f}', '-i', info.path] + inputs
+            runner.run(args + ['-filter_complex', graph, '-map', '[out]', '-frames:v', str(count),
+                               '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-pix_fmt', 'yuv420p',
+                               '-progress', 'pipe:1', str(target)], duration, progress, weight)
+            files.append((target, duration))
+            rendered += last-first
+        listing = work / 'parts.ffconcat'
+        write_concat(listing, files)
+        pending = work / 'preview.mp4'
+        args = FFMPEG + ['-f', 'concat', '-safe', '0', '-i', str(listing), '-i', info.path, '-map', '0:v:0',
+                         '-c:v', 'copy', '-movflags', '+faststart']
+        args += edited_audio_options(info, project.edits, start, end, 1)
+        runner.run(args + ['-progress', 'pipe:1', str(pending)], sum(d for _, d in files), 90, 9)
+        runner.check()
+        project.check_source()
+        os.replace(pending, destination)
     return str(destination)

@@ -32,7 +32,7 @@ class EditorUpgradeTests(unittest.TestCase):
         w.canvas.frame_time = 1.25
         w.tracking_runtime = lambda: ('python.exe', Path(self.temp.name))
         w.start_job = Mock()
-        w.layer_panel.track.click()
+        w.track_sticker_button.click()
         self.assertEqual(w.canvas.mask_shape, 'rect')
         first, second = Rect(.1, .15, .2, .2), Rect(.4, .25, .2, .2)
         w.finish_mask(Mask('rect', Transform.from_rect(first)))
@@ -52,7 +52,7 @@ class EditorUpgradeTests(unittest.TestCase):
 
     def test_review_detection_marks_and_applies_once(self):
         w = self.window([Edit(1, 2, 'none', layers=[]), Edit(3, 4, 'none', layers=[])])
-        w.editor_tabs.setCurrentWidget(w.detection_tab)
+        w.show_auto_mosaic()
         tracks = [SimpleNamespace(id=f'track-{i}', label='BUTTOCKS_EXPOSED', score=.9,
                                  start=start, end=start+.1, points=[(start, Rect(.1, .2, .3, .3))])
                   for i, start in enumerate((1.1, 1.5))]
@@ -218,7 +218,7 @@ class EditorUpgradeTests(unittest.TestCase):
         self.assertAlmostEqual(layers[1].transform.x, .6)
         w.position_changed(2000)
         w.editor_tabs.setCurrentIndex(2)
-        w.layer_panel.picker.setCurrentIndex(1)
+        w.layer_panel.picker.setCurrentRow(1)
         QTest.mouseClick(w.layer_panel.redraw, Qt.LeftButton)
         a, b = (QPoint(round(box.x()+box.width()*x), round(box.y()+box.height()*x)) for x in (.4, .7))
         QTest.mousePress(w.canvas, Qt.LeftButton, Qt.NoModifier, a)
@@ -241,7 +241,7 @@ class EditorUpgradeTests(unittest.TestCase):
         self.assertAlmostEqual(w.current_edit().layers[1].transform.angle, 90, delta=2)
         geometry_field = w.layer_panel.geometry[0]
         geometry_field.setFocus()
-        QTest.keyClick(geometry_field.lineEdit(), Qt.Key_Escape)
+        QTest.keyClick(geometry_field.editor, Qt.Key_Escape)
         self.assertEqual(w.current_edit().layers[1].transform, changed.transform)
         self.assertEqual(w.current_edit().layers[1].mask, changed.mask)
         QTest.mouseClick(w.layer_timeline, Qt.LeftButton, Qt.NoModifier, QPoint(50, 32))

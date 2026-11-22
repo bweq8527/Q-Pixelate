@@ -1,0 +1,5 @@
+{
+  "model": "640m",
+  "device": "gpu",
+  "ffmpeg_directory": null
+}

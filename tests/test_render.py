@@ -7,10 +7,109 @@ from media_helpers import command, fixture, hashes, image_at
 from q_pixelate.model import Edit, Layer, Mask, Project, Rect, Transform
 from q_pixelate.process import Cancelled, Runner
 from q_pixelate.media import probe, index_video
-from q_pixelate.render import Exporter, render_preview
+from q_pixelate.render import Exporter, render_preview, render_project_preview
 
 
 class RenderTests(unittest.TestCase):
+    def test_omit_retimes_all_audio_and_keeps_video_outside_removed_gops(self):
+        edit = Edit(2.25, 3.15, 'blur', speed=.25, omit=True)
+        out, report = self.export([edit], 'removed.mp4')
+        frames = hashes(out)
+        self.assertEqual(report.frames, 102)
+        self.assertEqual(frames[:40], self.original[:40])
+        self.assertEqual(frames[62:], self.original[80:])
+        self.assertAlmostEqual(report.encoded_seconds, 1.1, places=3)
+        info = probe(out, Runner())
+        self.assertEqual(len(info.audio), 2)
+        self.assertEqual(info.audio[0]['tags']['language'], 'zho')
+        for track in info.audio:
+            self.assertAlmostEqual(float(track['duration']), 5.1, delta=.08)
+
+    def test_preview_of_consecutive_omissions_and_entire_edit(self):
+        edits = [Edit(1, 2, 'none', omit=True), Edit(2, 4, 'none', omit=True),
+                 Edit(4, 5, 'none', speed=2)]
+        project = Project(str(self.source), edits)
+        selected = self.root / 'remove-preview.mp4'
+        whole = self.root / 'whole-preview.mp4'
+        render_preview(project, 1, selected, Runner())
+        render_project_preview(project, whole, Runner())
+        self.assertEqual(len(hashes(selected)), 30)
+        self.assertEqual(len(hashes(whole)), 50)
+        self.assertAlmostEqual(probe(selected, Runner()).duration, 1.5, delta=.08)
+        self.assertAlmostEqual(probe(whole, Runner()).duration, 2.5, delta=.08)
+
+    def test_omission_removes_content_but_preserves_a_wholly_cut_audio_track(self):
+        import array
+
+        source = self.root / 'colored-sections.mp4'
+        command('ffmpeg', '-v', 'error', '-y',
+                '-f', 'lavfi', '-i', 'color=blue:s=160x96:r=20:d=1',
+                '-f', 'lavfi', '-i', 'color=red:s=160x96:r=20:d=1',
+                '-f', 'lavfi', '-i', 'color=green:s=160x96:r=20:d=1',
+                '-itsoffset', '1.15', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=0.7',
+                '-filter_complex', '[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]', '-map', '[v]', '-map', '3:a',
+                '-c:v', 'libx264', '-g', '40', '-sc_threshold', '0', '-c:a', 'aac', str(source))
+        out, _ = self.export([Edit(1, 2, 'none', omit=True)], 'silent-retained-track.mp4', source)
+        self.assertEqual(len(hashes(out)), 40)
+        self.assertGreater(image_at(out, 19).getpixel((60, 45))[2], 220)
+        self.assertGreater(image_at(out, 20).getpixel((60, 45))[1], 115)
+        samples = array.array('h', command('ffmpeg', '-v', 'error', '-i', str(out), '-map', '0:a:0',
+                                          '-ar', '8000', '-f', 's16le', '-'))
+        self.assertAlmostEqual(len(samples), 16000, delta=300)
+        self.assertLess(max(abs(sample) for sample in samples), 25)
+
+    def test_fully_omitted_project_cannot_export(self):
+        with self.assertRaisesRegex(ValueError, '全部|没有保留'):
+            self.export([Edit(0, 6, 'none', omit=True)], 'fully-removed.mp4')
+
+    def test_omit_after_first_frame_preserves_decode_order_at_copied_gop(self):
+        output, report = self.export([Edit(.05, 2, 'none', omit=True)], 'one-frame-splice.mp4')
+        frames = hashes(output)
+        self.assertEqual(report.frames, 81)
+        self.assertEqual(frames[1:], self.original[40:])
+
+    def test_tracked_blur_moves_with_box_in_preview_and_export(self):
+        from PIL import ImageChops, ImageStat
+
+        first, last = Rect(.12, .25, .20, .5), Rect(.68, .25, .20, .5)
+        layer = Layer(0, 1, 'blur', transform=Transform.from_rect(first),
+                      motion=[(0, first), (.75, last)])
+        edit = Edit(2, 3, 'none', layers=[layer])
+        out, _ = self.export([edit], 'tracked-blur.mp4')
+        preview = self.root / 'tracked-blur-preview.mp4'
+        render_preview(Project(str(self.source), [edit]), 0, preview, Runner())
+        for video, offset in ((out, 40), (preview, 0)):
+            for frame, covered, clear in ((0, (40,45,100,135), (218,45,278,135)),
+                                          (16, (218,45,278,135), (40,45,100,135))):
+                original = image_at(self.source, 40+frame)
+                output = image_at(video, offset+frame)
+                delta = ImageChops.difference(original, output)
+                self.assertGreater(sum(ImageStat.Stat(delta.crop(covered)).mean), 18)
+                self.assertLess(sum(ImageStat.Stat(delta.crop(clear)).mean), 12)
+
+    def test_whole_preview_materializes_masks_only_in_the_motion_interval(self):
+        class CountMasks(Runner):
+            def __init__(self):
+                super().__init__()
+                self.frames = 0
+
+            def run(self, args, *options, input_chunks=None, **kwargs):
+                def count_masks():
+                    for chunk in input_chunks:
+                        self.frames += 1
+                        yield chunk
+
+                return super().run(args, *options, input_chunks=count_masks() if input_chunks else None, **kwargs)
+
+        box = Rect(.25, .25, .5, .5)
+        layer = Layer(.12, .39, 'blur', transform=Transform.from_rect(box), motion=[(0, box)])
+        edit = Edit(2, 3, 'none', layers=[layer])
+        preview = self.root / 'whole-preview-short-motion.mp4'
+        runner = CountMasks()
+        render_project_preview(Project(str(self.source), [edit]), preview, runner)
+        self.assertEqual(runner.frames, 5)  # Source frames [43, 48).
+        self.assertEqual(len(hashes(preview)), len(self.original))
+
     def test_layers_composite_by_time_and_sticker_mask_stays_in_video_coordinates(self):
         from PIL import Image
         sticker = self.root.resolve()/'green.png'

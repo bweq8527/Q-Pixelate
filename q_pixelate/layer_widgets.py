@@ -1,12 +1,28 @@
 from PySide6.QtCore import QMimeData, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout,
+    QAbstractItemView, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
 )
 
-from .widgets import TimeSpinBox
+from .parameter_widgets import ParamControl, WheelSafeComboBox
 from .stickers import STICKER_MIME
+
+
+OMIT_LAYER = '@omit'
+SPEED_LAYER = '@speed'
+
+
+def effect_rows(edit):
+    if not edit:
+        return []
+    rows = [(layer.id, layer.name or {'sticker': '贴纸', 'mosaic': '马赛克', 'blur': '模糊'}[layer.kind])
+            for layer in edit.layers or ()]
+    if edit.omit:
+        rows.append((OMIT_LAYER, '直接删除段落'))
+    if edit.speed_effect or edit.speed != 1:
+        rows.append((SPEED_LAYER, f'倍速段落 · {edit.speed:g}×'))
+    return rows
 
 
 class StickerList(QListWidget):
@@ -44,28 +60,31 @@ class StickerList(QListWidget):
         drag.exec(Qt.DropAction.CopyAction)
 
 
+class LayerPicker(QListWidget):
+    def __init__(self):
+        super().__init__()
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setMinimumHeight(92)
+        self.setMaximumHeight(112)
+        self.setToolTip('单击选择 · Ctrl 加选 · Shift 连选')
+
 class LayerInspector(QWidget):
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.picker = QComboBox()
+        self.picker = LayerPicker()
         layout.addWidget(self.picker)
-        row = QHBoxLayout()
-        self.draw = QPushButton('绘制遮罩')
-        self.full_blur = QPushButton('＋全屏模糊')
-        self.shape = QComboBox()
+        self.shape = WheelSafeComboBox()
         for label, value in [('方框', 'rect'), ('椭圆', 'ellipse'), ('套索', 'lasso')]:
             self.shape.addItem(label, value)
-        for widget in (self.draw, self.shape, self.full_blur):
-            row.addWidget(widget)
-        layout.addLayout(row)
         self.redraw = QPushButton('绘制 / 重绘本层遮罩')
-        layout.addWidget(self.redraw)
         row = QHBoxLayout()
-        self.track = QPushButton('框选并追踪贴纸')
+        row.addWidget(self.redraw, 1)
+        row.addWidget(self.shape)
+        layout.addLayout(row)
+        row = QHBoxLayout()
         self.track_end = QPushButton('查看追踪结束')
-        row.addWidget(self.track)
         row.addWidget(self.track_end)
         layout.addLayout(row)
         row = QHBoxLayout()
@@ -76,21 +95,21 @@ class LayerInspector(QWidget):
             row.addWidget(widget)
         layout.addLayout(row)
         self.details = QWidget()
-        form = QFormLayout(self.details)
+        form = self.form = QFormLayout(self.details)
         form.setContentsMargins(0, 0, 0, 0)
         self.name = QLineEdit()
         form.addRow('图层名称', self.name)
-        self.start, self.end = TimeSpinBox(), TimeSpinBox()
+        self.start, self.end = ParamControl(time=True), ParamControl(time=True)
         form.addRow('图层入点', self.start)
         form.addRow('图层出点', self.end)
-        self.kind = QComboBox()
+        self.kind = WheelSafeComboBox()
         self.kind.addItem('模糊', 'blur')
         self.kind.addItem('贴纸', 'sticker')
         self.kind.addItem('马赛克', 'mosaic')
         form.addRow('遮罩用途', self.kind)
         self.asset = QPushButton('使用素材库选中的贴纸')
         form.addRow(self.asset)
-        self.target = QComboBox()
+        self.target = WheelSafeComboBox()
         self.target.addItem('贴纸', 'sticker')
         self.target.addItem('遮罩', 'mask')
         form.addRow('变换对象', self.target)
@@ -112,17 +131,28 @@ class LayerInspector(QWidget):
         form.addRow(self.transform)
         layout.addWidget(self.details)
 
+        self.paragraph = QWidget()
+        paragraph_form = QFormLayout(self.paragraph)
+        paragraph_form.setContentsMargins(0, 0, 0, 0)
+        self.speed = self.spin(.25, 4)
+        self.speed.setSuffix(' ×')
+        paragraph_form.addRow('片段速度', self.speed)
+        self.speed_label = paragraph_form.labelForField(self.speed)
+        self.paragraph_note = QLabel()
+        self.paragraph_note.setWordWrap(True)
+        paragraph_form.addRow(self.paragraph_note)
+        layout.addWidget(self.paragraph)
+
     @staticmethod
     def spin(lo, hi, decimals=2):
-        spin = QDoubleSpinBox()
+        spin = ParamControl(decimals=decimals)
         spin.setRange(lo, hi)
-        spin.setDecimals(decimals)
-        spin.setKeyboardTracking(False)
         return spin
 
 
 class LayerTimeline(QWidget):
     activated = Signal(int)
+    selectionModified = Signal(int, object)
     dragged = Signal(int, float, float)
     row_height = 24
 
@@ -130,7 +160,7 @@ class LayerTimeline(QWidget):
         super().__init__()
         self.timeline = timeline
         self.edit = None
-        self.selected = -1
+        self.selected = set()
         self.drag = None
         self.candidate = None
         self.setFocusPolicy(Qt.StrongFocus)
@@ -138,50 +168,63 @@ class LayerTimeline(QWidget):
 
     def set_edit(self, edit, selected):
         self.edit, self.selected = edit, selected
-        self.setMinimumHeight(max(1, len(edit.layers) if edit else 0)*self.row_height)
+        self.setMinimumHeight(max(1, len(effect_rows(edit)))*self.row_height)
         self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor('#131923'))
-        if not self.edit or not self.edit.layers:
+        rows = effect_rows(self.edit)
+        if not rows:
             painter.setPen(QColor('#9aacc2'))
             painter.drawText(20, 17, '图层轨 · 将贴纸拖入画面，或绘制遮罩')
             return
         for index in range(max(0, event.rect().top()//self.row_height),
-                           min(len(self.edit.layers), event.rect().bottom()//self.row_height+1)):
-            layer = self.edit.layers[index]
+                           min(len(rows), event.rect().bottom()//self.row_height+1)):
+            layer = self.edit.layers[index] if index < len(self.edit.layers) else None
+            layer_id, title = rows[index]
+            selected = index in self.selected
             y = index*self.row_height
             area = QRectF(20, y+2, self.width()-39, self.row_height-3)
-            painter.fillRect(area, QColor('#29394e' if index == self.selected else '#202b3a'))
+            painter.fillRect(area, QColor('#29394e' if selected else '#202b3a'))
             painter.save()
             painter.setClipRect(area)
-            start, end = self.candidate if self.drag and self.drag[0] == index else self.edit.layer_span(layer)
+            if self.drag and self.drag[0] == index:
+                start, end = self.candidate
+            elif layer:
+                start, end = self.edit.layer_span(layer)
+            else:
+                start, end = self.edit.start, self.edit.end
             if start < end:
                 left, right = (self.timeline.point_for_time(t).x() for t in (start, end))
-                color = QColor({'sticker': '#7864a6', 'mosaic': '#93664c'}.get(layer.kind, '#317569'))
+                kind = layer.kind if layer else layer_id
+                color = QColor({'sticker': '#7864a6', 'mosaic': '#93664c', OMIT_LAYER: '#994459',
+                                SPEED_LAYER: '#345b9a'}.get(kind, '#317569'))
                 painter.fillRect(QRectF(left, y+3, max(2, right-left), self.row_height-5), color)
-                if index == self.selected:
+                if selected:
                     painter.setPen(QPen(QColor('#d5fff1'), 1))
                     painter.drawRect(QRectF(left, y+3, max(2, right-left), self.row_height-5))
             painter.setPen(QColor('#e5edf8'))
-            text = layer.name or {'sticker': '贴纸', 'mosaic': '马赛克', 'blur': '模糊'}[layer.kind]
-            painter.drawText(26, y+17, f'{index+1:02}  {text}' + (' · 范围外' if start >= end else ''))
+            painter.drawText(26, y+17, f'{index+1:02}  {title}' + (' · 范围外' if start >= end else ''))
             painter.restore()
         x = self.timeline.point_for_time(self.timeline.position).x()
         if 20 <= x <= self.width()-19:
             painter.setPen(QPen(QColor('#ffb86b'), 1, Qt.PenStyle.DotLine))
-            painter.drawLine(x, 0, x, len(self.edit.layers)*self.row_height)
+            painter.drawLine(x, 0, x, len(rows)*self.row_height)
 
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton or not self.edit:
             return
         index = int(event.position().y())//self.row_height
-        if not 0 <= index < len(self.edit.layers):
+        if not 0 <= index < len(effect_rows(self.edit)):
             return
         self.setFocus()
+        modifiers = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
+        if modifiers:
+            self.selectionModified.emit(index, modifiers)
+            return
         self.activated.emit(index)
-        if self.edit.locked:
+        if self.edit.locked or index >= len(self.edit.layers):
             return
         a, b = self.edit.layer_span(self.edit.layers[index])
         if a >= b:

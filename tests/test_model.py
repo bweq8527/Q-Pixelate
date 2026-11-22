@@ -3,10 +3,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from q_pixelate.model import Edit, Project, Rect, plan_ranges
+from q_pixelate.model import Edit, Layer, Project, Rect, Transform, plan_ranges
 
 
 class ModelTests(unittest.TestCase):
+    def test_workflow_options_and_tracked_blur_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.mp4'
+            source.write_bytes(b'video')
+            first = Rect(.2, .2, .25, .2)
+            second = Rect(.6, .2, .25, .2)
+            layer = Layer(0, 1, 'blur', transform=Transform.from_rect(first),
+                          motion=[(0, first), (1, second)])
+            edits = [Edit(1, 3, 'none', layers=[layer], omit=True, speed_effect=True)]
+            path = root / 'workflow.qpixel'
+            Project(str(source), edits).save(path)
+            self.assertEqual(Project.load(path).edits, edits)
+
     def test_extended_edit_persistence_and_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -128,9 +128,9 @@ class Layer:
             if not self.motion or self.mask or self.image or self.transform.angle:
                 raise ValueError('马赛克图层需要矩形轨迹。')
         elif self.motion:
-            if self.kind != 'sticker':
-                raise ValueError('仅贴纸和马赛克图层支持矩形轨迹。')
-            if self.mask is not None:
+            if self.kind == 'blur' and (self.mask or self.image or self.transform.angle):
+                raise ValueError('追踪模糊图层需要矩形轨迹。')
+            if self.kind == 'sticker' and self.mask is not None:
                 raise ValueError('跟随贴纸不能添加遮罩。')
         if self.motion:
             previous = -math.inf
@@ -156,6 +156,8 @@ class Edit:
     range_locked: bool = False
     locked: bool = False
     layers: list[Layer] | None = None
+    omit: bool = False
+    speed_effect: bool = False
 
     def promote_layers(self, width, height):
         if self.layers is not None:
@@ -194,6 +196,8 @@ class Edit:
             raise ValueError('片段速度须为 0.25–4 倍。')
         if not isinstance(self.range_locked, bool) or not isinstance(self.locked, bool):
             raise ValueError('片段锁定状态无效。')
+        if not isinstance(self.omit, bool) or not isinstance(self.speed_effect, bool):
+            raise ValueError('段落效果状态无效。')
         if self.layers is not None:
             ids = set()
             for layer in self.layers:
@@ -279,8 +283,15 @@ class Project:
                     layer['image'] = relative(layer['image'])
                     if not layer['motion']:
                         layer.pop('motion')
+            for key in ('omit', 'speed_effect'):
+                if getattr(edit, key):
+                    raw[key] = True
+                else:
+                    raw.pop(key, None)
             edits.append(raw)
-        version = (5 if any(layer.kind == 'sticker' and layer.motion for e in self.edits for layer in e.layers or [])
+        version = (6 if any(e.omit or e.speed_effect or any(layer.kind == 'blur' and layer.motion for layer in e.layers or [])
+                            for e in self.edits)
+                   else 5 if any(layer.kind == 'sticker' and layer.motion for e in self.edits for layer in e.layers or [])
                    else 4 if any(layer.kind == 'mosaic' for e in self.edits for layer in e.layers or [])
                    else 3 if any(e.layers is not None for e in self.edits) else 2)
         data = {'version': version, 'source': relative(self.source),
@@ -301,7 +312,7 @@ class Project:
         path = Path(path).resolve()
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
-            if not isinstance(data, dict) or data.get('version') not in (1, 2, 3, 4, 5):
+            if not isinstance(data, dict) or data.get('version') not in (1, 2, 3, 4, 5, 6):
                 raise ValueError('工程格式或版本不受支持。')
             def absolute(value):
                 if not isinstance(value, str):

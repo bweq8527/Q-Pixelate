@@ -5,9 +5,10 @@ from dataclasses import dataclass, replace
 
 from PySide6.QtCore import QSignalBlocker, Qt
 from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-                               QPushButton, QSpinBox, QVBoxLayout, QWidget)
+                               QPushButton, QVBoxLayout, QWidget)
 
 from .model import Layer, Transform
+from .parameter_widgets import ParamControl
 from .widgets import time_text
 
 
@@ -27,7 +28,7 @@ class DetectionBatch:
 
 
 class AutomaticMosaic:
-    def setup_detection_tab(self):
+    def setup_detection_panel(self):
         self.detection_batches = {}
         self._listed_batch = None
         self._active_detection_key = None
@@ -38,14 +39,13 @@ class AutomaticMosaic:
         layout.addWidget(self.detection_label)
         row = QHBoxLayout()
         self.scan_all_frames = QCheckBox('逐帧扫描')
-        self.scan_fps = QSpinBox()
+        self.scan_fps = ParamControl(decimals=0)
         self.scan_fps.setRange(1, 30)
         self.scan_fps.setValue(6)
         self.scan_fps.setSuffix(' 帧/秒')
         self.scan_all_frames.toggled.connect(self.scan_fps.setDisabled)
         row.addWidget(self.scan_all_frames)
-        row.addWidget(self.scan_fps)
-        row.addStretch()
+        row.addWidget(self.scan_fps, 1)
         layout.addLayout(row)
         self.scan_button = QPushButton('识别裸露内容')
         self.scan_button.clicked.connect(self.scan_selection)
@@ -62,8 +62,6 @@ class AutomaticMosaic:
         self.mosaic_button.setToolTip('将所有勾选的检测结果转成可编辑的马赛克图层')
         self.mosaic_button.clicked.connect(self.apply_detection_results)
         layout.addWidget(self.mosaic_button)
-        self.editor_tabs.addTab(self.detection_tab, '自动打码')
-        self.editor_tabs.currentChanged.connect(lambda _: self.update_canvas_mask())
 
     def detection_key(self):
         if self.project and 0 <= self._editing_row < len(self.project.edits):
@@ -171,7 +169,7 @@ class AutomaticMosaic:
             self.update_canvas_mask(batch.tracks[row].start)
 
     def detection_boxes_at(self, seconds):
-        if self.editor_tabs.currentWidget() != self.detection_tab:
+        if self.editor_tabs.currentWidget() != self.effects_tab or self.detection_tab.isHidden():
             return []
         key = self.detection_key()
         batch = self.detection_batches.get(key)
@@ -206,4 +204,5 @@ class AutomaticMosaic:
         self.cancel_layer_interaction()
         self._layer_id, self._layer_target = additions[0].id, 'mask'
         self.store_layer_edit(replace(edit, layers=[*edit.layers, *additions]))
+        self.editor_tabs.setCurrentWidget(self.layer_properties_tab)
         self.status.setText(f'已添加 {len(additions)} 个马赛克图层，可在图层属性调整。')
