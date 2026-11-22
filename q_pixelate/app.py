@@ -535,7 +535,9 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         for title, value in (('方框', 'rect'), ('椭圆', 'ellipse'), ('套索', 'lasso')):
             shape.addItem(title, value)
         self.track_sticker_button = button('追踪贴纸', self.add_tracking_sticker_effect)
-        track_blur = button('追踪模糊遮罩层', self.begin_blur_tracking)
+        self.track_blur_button = button('追踪模糊遮罩层', self.begin_blur_tracking)
+        for widget in (self.track_sticker_button, self.track_blur_button):
+            widget.setToolTip('请单独选中一段，在该段画面上框选追踪目标。')
         full = button('全屏模糊', self.add_full_blur_effect)
         self.auto_effect_button = button('自动打码', self.show_auto_mosaic)
         self.auto_effect_button.setCheckable(True)
@@ -547,7 +549,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         row = QHBoxLayout()
         row.addWidget(masked, 1)
         row.addWidget(shape)
-        row.addWidget(track_blur, 1)
+        row.addWidget(self.track_blur_button, 1)
         layout.addLayout(row)
         layout.addWidget(label('段落效果', 'section'))
         omit = button('直接删除段落', lambda: self.add_paragraph_effect('omit'))
@@ -561,7 +563,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         layout.addWidget(self.detection_tab)
         self.detection_tab.hide()
         layout.addStretch()
-        self.effect_buttons = (static, masked, shape, self.track_sticker_button, track_blur, full,
+        self.effect_buttons = (static, masked, shape, self.track_sticker_button, self.track_blur_button, full,
                                self.auto_effect_button, omit, speed)
         self.editor_tabs.currentChanged.connect(lambda _: self.update_canvas_mask())
         return self.effects_tab
@@ -596,17 +598,25 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.editor_tabs.setCurrentWidget(self.layer_properties_tab)
 
     def add_paragraph_effect(self, kind):
-        edit = self.promote_selected_edit()
-        if not edit or edit.locked:
+        rows = self.editable_clip_rows()
+        if not rows:
             return
         self.cancel_layer_interaction()
+        changed = {}
+        for row in rows:
+            edit = self.promote_clip(self.clip_edit(row))
+            if kind == 'omit' and not edit.omit:
+                changed[row] = replace(edit, omit=True)
+            elif kind == 'speed' and not edit.speed_effect:
+                changed[row] = replace(edit, speed_effect=True, speed=edit.speed if edit.speed != 1 else 2)
+        if changed:
+            self.store_layer_edits(changed)
         if kind == 'omit':
-            if not edit.omit:
-                self.store_layer_edit(replace(edit, omit=True))
-            self.status.setText('预览和导出将跳过当前选区。移除「直接删除段落」效果可恢复。')
-        elif not edit.speed_effect:
-            self.store_layer_edit(replace(edit, speed_effect=True, speed=edit.speed if edit.speed != 1 else 2))
+            self.status.setText(f'预览和导出将跳过 {len(rows)} 个选区。移除「直接删除段落」效果可恢复。')
+        if self._editing_row not in rows:
+            self.set_clip_selection(self.timeline.selected_rows, rows[0])
         self.select_effect_layer('@omit' if kind == 'omit' else '@speed')
+        self.update_edit_controls()
         self.editor_tabs.setCurrentWidget(self.layer_properties_tab)
 
     def update_enabled(self):
@@ -946,13 +956,23 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.show_clip_selection(rows)
 
     def show_clip_selection(self, rows):
+        if rows != self.timeline.selected_rows and (self._mask_context or self._tracking_request):
+            self.cancel_layer_interaction()
         self.timeline.selected_rows = rows
         count = self.clip_list.count()
         self.count_label.setText(f'{count} 段 · 已选 {len(rows)} 段' if rows else f'{count} 段')
         self.remove_clips_button.setEnabled(any(not self.project.edits[row].locked for row in rows))
         self.preview_selection_button.setText('预览活动选区' if len(rows) > 1 else '预览所选片段')
-        self.confirm_button.setText('确认活动选区' if len(rows) > 1 else '确认修改')
-        self.timeline.update()
+        self.confirm_button.setText('确认所选选区' if len(rows) > 1 else '确认修改')
+        self.update_effect_buttons()
+        self.sync_detection()
+
+    def editable_clip_rows(self):
+        return sorted(row for row in self.timeline.selected_rows
+                      if 0 <= row < len(self.project.edits) and not self.project.edits[row].locked)
+
+    def clip_edit(self, row):
+        return self.current_edit() if row == self._editing_row else self.timeline.edits[row]
 
     def select_uncovered_ranges(self):
         if self.info:
@@ -1031,26 +1051,34 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         if not self.project or row < 0:
             self.status.setText('请先添加片段或在列表中选择要修改的片段。')
             return False
-        if self.project.edits[row].locked:
+        if len(self.timeline.selected_rows) > 1:
+            self.stash_edit()
+            pending = {i: self._drafts[i] for i in self.editable_clip_rows() if i in self._drafts}
+            if not pending:
+                self.status.setText('所选选区没有待确认的修改。')
+                return False
+        elif self.project.edits[row].locked:
             self.status.setText('请先点击「解锁旧片段」。')
             return False
-        edit = self.current_edit()
-        if edit.layers is None:
-            edit.locked = True
-            edit.range_locked = True
+        else:
+            pending = {row: self.current_edit()}
+        for i, edit in pending.items():
+            if edit.layers is None:
+                pending[i] = replace(edit, locked=True, range_locked=True)
         try:
-            edit.validate(self.info.duration)
-            if any(index != row and edit.start < other.end-1e-8 and edit.end > other.start+1e-8
-                   for index, other in enumerate(self.timeline.edits)):
-                raise ValueError('修订片段重叠，请调整入点和出点。')
+            for i, edit in pending.items():
+                edit.validate(self.info.duration)
+                if any(j != i and edit.start < other.end-1e-8 and edit.end > other.start+1e-8
+                       for j, other in enumerate(self.timeline.edits)):
+                    raise ValueError('修订片段重叠，请调整入点和出点。')
         except ValueError as exc:
             self.error(str(exc))
             return False
-        self.project.edits[row] = edit
-        self._drafts.pop(row, None)
-        self._range_locked = edit.range_locked
-        self.timeline.edits[row] = edit
-        self.clip_list.item(row).setText(self.edit_caption(row, edit))
+        for index, edit in pending.items():
+            self.project.edits[index] = self.timeline.edits[index] = edit
+            self._drafts.pop(index, None)
+            self.clip_list.item(index).setText(self.edit_caption(index, edit))
+        self._range_locked = self.project.edits[row].range_locked
         self.update_edit_controls()
         self.show_clip_selection(self.timeline.selected_rows)
         self.changed()
@@ -1246,12 +1274,10 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.range_button.setEnabled(selected and not locked)
         self.range_button.setText('解锁片段长度' if self._range_locked else '锁定片段长度')
         self.range_button.setToolTip('Ctrl+L · 仅固定当前选区的入点和出点')
-        self.confirm_button.setEnabled(not locked and self._editing_row >= 0 and (layered or self._range_locked))
         self.unlock_button.setEnabled(locked)
         self.unlock_button.setVisible(locked)
         self.preview_selection_button.setEnabled(selected)
-        for widget in self.effect_buttons:
-            widget.setEnabled(selected and not locked)
+        self.update_effect_buttons()
         editable = not locked and self._range_locked
         index = self.effect.currentIndex()
         for widget in (self.effect, self.strength, self.shape, self.feather, self.redraw_button):
@@ -1275,6 +1301,18 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.timeline.update()
         self.sync_layer_editor()
         self.sync_detection()
+
+    def update_effect_buttons(self):
+        multiple = len(self.timeline.selected_rows) > 1
+        editable = bool(self.editable_clip_rows())
+        for widget in self.effect_buttons:
+            widget.setEnabled(editable)
+        for widget in (self.track_sticker_button, self.track_blur_button):
+            widget.setEnabled(editable and not multiple)
+        if not multiple:
+            editable = self._editing_row >= 0 and not self.selected_locked() and (
+                self.layer_edit() is not None or self._range_locked)
+        self.confirm_button.setEnabled(editable)
 
     def toggle_range_lock(self):
         if self._editing_row < 0 or self.selected_locked():

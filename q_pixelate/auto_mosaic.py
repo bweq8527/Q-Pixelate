@@ -59,7 +59,7 @@ class AutomaticMosaic:
         layout.addWidget(self.detection_position)
         self.mosaic_button = QPushButton('全部马赛克')
         self.mosaic_button.setObjectName('primary')
-        self.mosaic_button.setToolTip('将所有勾选的检测结果转成可编辑的马赛克图层')
+        self.mosaic_button.setToolTip('将所选选区内已勾选的检测结果转成马赛克图层。可切换活动选区逐段审核。')
         self.mosaic_button.clicked.connect(self.apply_detection_results)
         layout.addWidget(self.mosaic_button)
 
@@ -70,8 +70,8 @@ class AutomaticMosaic:
         return None
 
     def scan_selection(self):
-        key = self.detection_key()
-        if key is None or self.selected_locked():
+        rows = self.editable_clip_rows()
+        if not rows:
             return
         manager = self.components
         settings = manager.preferences()
@@ -86,18 +86,43 @@ class AutomaticMosaic:
             python = sys.executable
         rate = None if self.scan_all_frames.isChecked() else self.scan_fps.value()
         mode = '逐帧' if rate is None else f'快速 · {rate} 帧/秒'
-        edit, info = self.current_edit(), self.info
+        edits = [self.clip_edit(row) for row in rows]
+        info = self.info
 
         def task(runner):
             from .detection import scan
-            return scan(info, edit, runner, python=python, site_packages=manager.path(device)/'site-packages',
-                        model=manager.path(model)/'weights.onnx', device=device, sample_fps=rate)
+            batches = {}
+            progress = runner.progress
+            for index, edit in enumerate(edits):
+                if len(edits) > 1:
+                    runner.progress = lambda value, text, i=index: progress(
+                        int((100*i+value)/len(edits)), f'选区 {i+1}/{len(edits)} · {text}')
+                batches[edit.start, edit.end] = scan(
+                    info, edit, runner, python=python, site_packages=manager.path(device)/'site-packages',
+                    model=manager.path(model)/'weights.onnx', device=device, sample_fps=rate)
+            return batches
 
-        self.start_job(task, lambda tracks: self.show_detection_results(key, tracks, mode))
+        def done(batches):
+            if len(batches) == 1 and self.detection_key() in batches:
+                key, tracks = next(iter(batches.items()))
+                self.show_detection_results(key, tracks, mode)
+                return
+            for key, tracks in batches.items():
+                self.store_detection_batch(key, tracks, mode)
+            self.sync_detection()
+            count = sum(map(len, batches.values()))
+            self.status.setText(f'{mode}扫描完成 · {len(batches)} 个选区 · {count} 个候选区域')
+
+        self.start_job(task, done)
 
     def show_detection_results(self, key, tracks, mode):
         if key != self.detection_key():
             return
+        self.store_detection_batch(key, tracks, mode)
+        self.sync_detection()
+        self.status.setText(f'{mode}扫描完成 · {len(tracks)} 个候选区域' if tracks else f'{mode}扫描完成 · 未检测到')
+
+    def store_detection_batch(self, key, tracks, mode):
         layers = []
         for track in tracks:
             label = LABELS.get(track.label, track.label)
@@ -105,8 +130,6 @@ class AutomaticMosaic:
                                 transform=Transform.from_rect(track.points[0][1]), strength=24, id=track.id,
                                 motion=[(t-track.start, box) for t, box in track.points]))
         self.detection_batches[key] = DetectionBatch(mode, tracks, layers, {track.id for track in tracks})
-        self.sync_detection()
-        self.status.setText(f'{mode}扫描完成 · {len(tracks)} 个候选区域' if tracks else f'{mode}扫描完成 · 未检测到')
 
     def sync_detection(self):
         key = self.detection_key()
@@ -116,9 +139,10 @@ class AutomaticMosaic:
         for retired in self.detection_batches.keys() - current_ranges:
             del self.detection_batches[retired]
         batch = self.detection_batches.get(key)
-        editable = key is not None and not self.selected_locked()
-        self.scan_button.setEnabled(editable)
-        self.mosaic_button.setEnabled(editable and bool(batch and batch.checked))
+        targets = [self.clip_edit(row) for row in self.editable_clip_rows()]
+        self.scan_button.setEnabled(bool(targets))
+        self.mosaic_button.setEnabled(any(found and found.checked for found in
+                                         (self.detection_batches.get((e.start, e.end)) for e in targets)))
         if batch is not self._listed_batch:
             self._listed_batch = batch
             with QSignalBlocker(self.detection_results):
@@ -137,10 +161,12 @@ class AutomaticMosaic:
             summary = f'{batch.mode} · {len(batch.tracks)} 个候选区域' if batch.tracks else f'{batch.mode} · 未检测到'
         elif key is None:
             summary = '请先建立或选中一个选区。'
-        elif not editable:
+        elif self.selected_locked():
             summary = '解锁当前选区后可扫描或应用检测结果。'
         else:
             summary = '扫描当前选区。快速扫描可能漏掉短暂画面。'
+        if len(self.timeline.selected_rows) > 1:
+            summary += '\n扫描和应用涵盖所选可编辑选区。列表显示活动选区的候选区域。'
         preferences = self.components.preferences()
         device = 'NVIDIA GPU' if preferences['device'] == 'gpu' else 'CPU'
         summary += f"\nNudeNet {preferences['model']} · {device}"
@@ -190,19 +216,30 @@ class AutomaticMosaic:
         return list(visible.values())
 
     def apply_detection_results(self):
-        batch = self.detection_batches.get(self.detection_key())
-        if not batch or not batch.checked or self.selected_locked():
-            return
-        edit = self.promote_selected_edit()
-        if not edit:
-            return
-        applied = {layer.id for layer in edit.layers}
-        additions = [layer for layer in batch.layers if layer.id in batch.checked and layer.id not in applied]
-        if not additions:
-            self.status.setText('勾选的结果已全部应用。')
+        changes, first_layers = {}, {}
+        count = 0
+        for row in self.editable_clip_rows():
+            edit = self.clip_edit(row)
+            batch = self.detection_batches.get((edit.start, edit.end))
+            if not batch or not batch.checked:
+                continue
+            edit = self.promote_clip(edit)
+            applied = {layer.id for layer in edit.layers}
+            additions = [layer for layer in batch.layers if layer.id in batch.checked and layer.id not in applied]
+            if additions:
+                changes[row] = replace(edit, layers=[*edit.layers, *additions])
+                first_layers[row] = additions[0].id
+                count += len(additions)
+        if not changes:
+            self.status.setText('没有待应用的勾选结果。')
             return
         self.cancel_layer_interaction()
-        self._layer_id, self._layer_target = additions[0].id, 'mask'
-        self.store_layer_edit(replace(edit, layers=[*edit.layers, *additions]))
-        self.editor_tabs.setCurrentWidget(self.layer_properties_tab)
-        self.status.setText(f'已添加 {len(additions)} 个马赛克图层，可在图层属性调整。')
+        self.store_layer_edits(changes)
+        row = self._editing_row if self._editing_row in changes else next(iter(changes))
+        if row != self._editing_row:
+            self.set_clip_selection(self.timeline.selected_rows, row)
+        self._layer_id, self._layer_target = first_layers[row], 'mask'
+        self.reset_layer_selection()
+        self.update_edit_controls()
+        self.open_layer_properties()
+        self.status.setText(f'已在 {len(changes)} 个选区添加 {count} 个马赛克图层。')

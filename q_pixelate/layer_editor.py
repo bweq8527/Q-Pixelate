@@ -1,5 +1,6 @@
 """Layer editing operations used by the main window."""
 import math
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -271,13 +272,16 @@ class LayerEditing(StickerTracking):
             self.select_layer(index)
 
     def store_layer_edit(self, edit):
-        row = self._editing_row
-        if edit != self.project.edits[row]:
-            self._drafts[row] = edit
-        else:
-            self._drafts.pop(row, None)
-        self.timeline.edits[row] = edit
-        self.clip_list.item(row).setText(self.edit_caption(row, edit))
+        self.store_layer_edits({self._editing_row: edit})
+
+    def store_layer_edits(self, edits):
+        for row, edit in edits.items():
+            if edit != self.project.edits[row]:
+                self._drafts[row] = edit
+            else:
+                self._drafts.pop(row, None)
+            self.timeline.edits[row] = edit
+            self.clip_list.item(row).setText(self.edit_caption(row, edit))
         self.timeline.update()
         self.changed()
         self.sync_layer_editor()
@@ -332,11 +336,38 @@ class LayerEditing(StickerTracking):
         self.store_layer_edit(replace(edit, layers=[*edit.layers, layer]))
 
     def promote_selected_edit(self):
-        edit = self.layer_edit()
-        if edit is None and self._editing_row >= 0 and not self.selected_locked():
-            edit = self.current_edit()
-            edit.promote_layers(self.info.width, self.info.height)
+        if self._editing_row >= 0 and not self.selected_locked():
+            return self.promote_clip(self.current_edit())
+
+    def promote_clip(self, edit):
+        if edit.layers is not None:
+            return edit
+        edit = replace(edit)
+        edit.promote_layers(self.info.width, self.info.height)
         return edit
+
+    def add_effect_layers(self, make_layer, target, *, rows=None):
+        rows = self.editable_clip_rows() if rows is None else rows
+        layers = {}
+        edits = {}
+        for row in rows:
+            edit = self.promote_clip(self.clip_edit(row))
+            start = self.default_layer_start(edit) if len(self.timeline.selected_rows) == 1 else 0
+            layer = make_layer(edit, start)
+            if layer is not None:
+                layers[row] = layer
+                edits[row] = replace(edit, layers=[*edit.layers, layer])
+        if not edits:
+            return False
+        self.cancel_layer_interaction()
+        self.store_layer_edits(edits)
+        row = self._editing_row if self._editing_row in layers else next(iter(layers))
+        if row != self._editing_row:
+            self.set_clip_selection(self.timeline.selected_rows, row)
+        self._layer_id, self._layer_target = layers[row].id, target
+        self.reset_layer_selection()
+        self.update_edit_controls()
+        return True
 
     def drop_sticker(self, path, point):
         if not self.project or self.worker or self.sticker_library_list.find_asset(path) is None:
@@ -352,31 +383,26 @@ class LayerEditing(StickerTracking):
             self.status.setText('播放位置所在的选区已锁定，请先解锁。')
             return
         self.activate_from_timeline(row)
-        if self.add_static_sticker(path, point):
+        if self.add_static_sticker(path, point, rows=[row]):
             self.begin_transform()
 
-    def add_static_sticker(self, path, point):
-        edit = self.promote_selected_edit()
-        if not edit or edit.locked:
-            return False
+    def add_static_sticker(self, path, point, *, rows=None):
         image = QImage(path)
         if image.isNull():
             self.status.setText('无法读取贴纸，请重新导入图片。')
             return False
         video_width, video_height = self.canvas.dimensions
         ratio = image.width()/image.height()/(video_width/video_height)
-        transform = Transform(point.x(), point.y(), .28*min(1, ratio), .28*min(1, 1/ratio))
-        start = self.default_layer_start(edit)
-        layer = Layer(start, min(start+2, edit.end-edit.start), 'sticker',
-                      Path(path).stem.rsplit('-', 1)[0], path, transform)
-        first, last = frame_bounds(replace(layer, start=edit.start+layer.start, end=edit.start+layer.end),
-                                   self.info.fps_float)
-        if first >= last:
-            self.status.setText('当前选区没有可放置贴纸的视频帧，请调整选区边界。')
-            return False
-        self.add_layer(edit, layer, 'sticker')
-        self.update_edit_controls()
-        return True
+        def make_layer(edit, start):
+            end = min(start+2, edit.end-edit.start)
+            first, last = frame_bounds(replace(edit, start=edit.start+start, end=edit.start+end), self.info.fps_float)
+            if first < last:
+                transform = Transform(point.x(), point.y(), .28*min(1, ratio), .28*min(1, 1/ratio))
+                return Layer(start, end, 'sticker', Path(path).stem.rsplit('-', 1)[0], path, transform)
+        added = self.add_effect_layers(make_layer, 'sticker', rows=rows)
+        if not added:
+            self.status.setText('所选选区没有可放置贴纸的视频帧。')
+        return added
 
     def default_layer_start(self, edit):
         seconds = self.timeline.position
@@ -387,14 +413,14 @@ class LayerEditing(StickerTracking):
         return 0
 
     def add_full_blur(self):
-        edit = self.promote_selected_edit()
-        if edit and not edit.locked:
-            self.add_layer(edit, Layer(self.default_layer_start(edit), edit.end-edit.start, name='全屏模糊'), 'mask')
+        self.add_effect_layers(lambda edit, start: Layer(start, edit.end-edit.start, name='全屏模糊'), 'mask')
 
     def begin_mask(self, redraw, shape=None):
-        edit = self.layer_edit() if redraw else self.promote_selected_edit()
+        if not redraw and not self.editable_clip_rows():
+            return
+        edit = self.layer_edit() if redraw else self.current_edit()
         layer = self.selected_layer(edit) if redraw else None
-        if not edit or edit.locked or (redraw and (not layer or layer.motion)):
+        if not edit or (redraw and (edit.locked or not layer or layer.motion)):
             return
         self.player.pause()
         self.cancel_layer_interaction()
@@ -409,17 +435,19 @@ class LayerEditing(StickerTracking):
             self.finish_tracking(mask)
             return
         context, self._mask_context = self._mask_context, None
-        edit = self.promote_selected_edit() if context else None
-        if not context or not edit or edit.locked or context[:3] != (self._editing_row, edit.start, edit.end):
+        if not context or self._editing_row < 0:
+            return
+        edit = self.current_edit()
+        if context[:3] != (self._editing_row, edit.start, edit.end):
             return
         if context[3]:
             layer = self.selected_layer(edit)
-            if layer and layer.id == context[3]:
+            if layer and not edit.locked and layer.id == context[3]:
                 self._layer_target = 'mask'
                 self.update_layer(mask=replace(mask, feather=layer.mask.feather if layer.mask else 0))
         else:
-            self.add_layer(edit, Layer(self.default_layer_start(edit), edit.end-edit.start,
-                                       name='区域遮罩', mask=mask), 'mask')
+            self.add_effect_layers(lambda clip, start: Layer(start, clip.end-clip.start,
+                                                             name='区域遮罩', mask=deepcopy(mask)), 'mask')
             self.open_layer_properties()
         self.status.setText('遮罩已绘制。可保持模糊，或选中素材并将遮罩用于贴纸。')
 

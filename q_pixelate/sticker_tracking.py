@@ -42,6 +42,9 @@ class StickerTracking:
         self.begin_tracking('blur')
 
     def begin_tracking(self, kind):
+        if len(self.timeline.selected_rows) > 1:
+            self.status.setText('请单独选中一段，在该段画面上框选追踪目标。')
+            return
         edit = self.promote_selected_edit()
         if not edit or edit.locked:
             self.status.setText('请先建立或解锁要追踪的选区。')

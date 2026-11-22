@@ -5,7 +5,7 @@ import unittest
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from PySide6.QtCore import Qt, QPoint, QPointF, QMimeData
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QWheelEvent
 from PySide6.QtTest import QTest
@@ -206,6 +206,68 @@ class EditorUpgradeTests(unittest.TestCase):
         self.assertEqual(w.clip_list.selectedItems(), [])
         self.assertFalse(w.preview_selection_button.isEnabled())
         self.assertEqual(len(w._drafts[1].layers), 1)
+
+    def test_effect_buttons_apply_and_confirm_all_editable_selected_clips(self):
+        w = self.window([Edit(.5, 1, 'none', layers=[]), Edit(1.5, 2.5, 'none', layers=[]),
+                         Edit(3, 4, locked=True), Edit(4.5, 5, 'none', layers=[])])
+        w.set_clip_selection({0, 1, 2}, 2)
+        w.effect_buttons[5].click()  # Full blur
+        w.effect_buttons[-1].click()  # Speed
+        w.effect_buttons[-2].click()  # Omit
+        self.assertEqual(w.timeline.selected_rows, {0, 1, 2})
+        self.assertEqual(w.confirm_button.text(), '确认所选选区')
+        self.assertTrue(w.apply_edit())
+        first, second, locked, unselected = w.project.edits
+        self.assertEqual([(e.omit, e.speed, [(l.start, l.end) for l in e.layers]) for e in (first, second)],
+                         [(True, 2, [(0, .5)]), (True, 2, [(0, 1)])])
+        self.assertNotEqual(first.layers[0].id, second.layers[0].id)
+        self.assertIsNone(locked.layers)
+        self.assertEqual(unselected.layers, [])
+        self.assertTrue(w.commit_form())
+
+    def test_drawn_mask_applies_to_each_selected_clip(self):
+        w = self.window([Edit(1, 2, 'none', layers=[]), Edit(3, 5, 'none', layers=[])])
+        w.select_all_clips()
+        w.begin_mask(False, 'rect')
+        mask = Mask('rect', Transform.from_rect(Rect(.1, .2, .3, .4)))
+        w.finish_mask(mask)
+        first, second = (edit.layers[0] for edit in w.timeline.edits)
+        self.assertEqual((first.mask, second.mask), (mask, mask))
+        self.assertEqual((first.end, second.end), (1, 2))
+        self.assertNotEqual(first.id, second.id)
+
+    def test_static_sticker_button_uses_each_selected_clips_duration(self):
+        w = self.window([Edit(1, 2, 'none', layers=[]), Edit(3, 5.5, 'none', layers=[])])
+        asset = Path(self.temp.name) / 'batch-sticker.png'
+        image = QImage(16, 16, QImage.Format.Format_RGB32)
+        image.fill(Qt.GlobalColor.red)
+        self.assertTrue(image.save(str(asset)))
+        w.sticker_library_list.add_asset(str(asset), '批量贴纸')
+        w.sticker_library_list.setCurrentRow(w.sticker_library_list.count()-1)
+        w.select_all_clips()
+        w.effect_buttons[0].click()
+        self.assertEqual([(e.layers[0].image, e.layers[0].end) for e in w.timeline.edits],
+                         [(str(asset), 1), (str(asset), 2)])
+
+    def test_batch_mosaic_uses_each_selected_clips_own_detections(self):
+        w = self.window([Edit(1, 2, 'none', layers=[]), Edit(3, 4, 'none', layers=[])])
+        w.select_all_clips()
+        w.start_job = Mock()
+        with patch.object(w.components, 'status', return_value={'ready': True}):
+            w.scan_button.click()
+        task, done = w.start_job.call_args.args
+
+        def detect(info, edit, runner, **options):
+            rect = Rect(.1 if edit.start == 1 else .5, .2, .3, .4)
+            start = edit.start + .25
+            return [SimpleNamespace(id=f'track-{edit.start}', label='BUTTOCKS_EXPOSED', score=.9,
+                                    start=start, end=start+.25, points=[(start, rect)])]
+
+        with patch('q_pixelate.detection.scan', side_effect=detect):
+            done(task(Runner()))
+        w.mosaic_button.click()
+        self.assertEqual([[layer.id for layer in edit.layers] for edit in w.timeline.edits],
+                         [['track-1'], ['track-3']])
 
     def test_select_all_uncovered_ranges_includes_gaps_that_contain_a_frame(self):
         w = self.window([Edit(.001, 1, 'none', layers=[]), Edit(2, 4.001, 'none', layers=[]),
