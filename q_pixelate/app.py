@@ -15,7 +15,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QPushButton,
-    QProgressBar, QScrollArea, QScrollBar, QSplitter, QTabWidget, QTextEdit,
+    QProgressBar, QScrollArea, QScrollBar, QSizePolicy, QSplitter, QTabWidget, QTextEdit,
     QVBoxLayout, QWidget, QAbstractSpinBox, QLineEdit, QAbstractItemView, QMenu,
 )
 
@@ -32,47 +32,7 @@ from .parameter_widgets import ParamControl, WheelSafeComboBox
 from .preview_widgets import EDIT_COLORS, PreviewProgress
 from .widgets import Timeline, VideoCanvas, time_text
 from .stickers import StickerLibrary
-
-
-STYLE = '''
-QMainWindow, QDialog { background: #0f141c; color: #dce6f3; }
-QWidget { color: #dce6f3; font-family: "Microsoft YaHei UI", "Segoe UI"; font-size: 12px; }
-QFrame#panel { background: #171f2b; border: 1px solid #283548; border-radius: 10px; }
-QLabel#brand { color: #72e6c3; font-size: 22px; font-weight: 700; }
-QLabel#muted { color: #91a0b6; }
-QLabel#section { color: #96a9c1; font-weight: 600; }
-QPushButton { background: #253247; border: 1px solid #35475f; border-radius: 6px; padding: 8px 12px; }
-QPushButton:hover { background: #32445c; border-color: #6ee7c0; }
-QPushButton:disabled { color: #607086; background: #1a2330; border-color: #283344; }
-QPushButton#primary { background: #73dfbc; color: #10251f; border: none; font-weight: 700; }
-QPushButton#primary:hover { background: #9ff3d6; }
-QPushButton#primary:disabled { background: #33564f; color: #738d85; }
-QPushButton#danger { color: #f1acac; }
-QListWidget, QTextEdit { background: #111923; border: 1px solid #304057; border-radius: 6px; padding: 5px; }
-QListWidget::item { padding: 9px 5px; border-radius: 4px; }
-QListWidget::item:selected { background: #284d49; color: #b8ffe7; }
-QMenu { background: #1b2939; border: 1px solid #35475f; padding: 4px; }
-QMenu::item { padding: 6px 20px; }
-QMenu::item:selected { background: #315f56; }
-QDoubleSpinBox, QComboBox, QLineEdit { background: #101923; border: 1px solid #35465c; border-radius: 5px; padding: 5px; }
-QComboBox QAbstractItemView { background: #1b2939; selection-background-color: #315f56; }
-QSlider::groove:horizontal { background: #2e3c50; height: 5px; border-radius: 2px; }
-QSlider::handle:horizontal { background: #73dfbc; width: 12px; margin: -4px 0; border-radius: 6px; }
-QProgressBar { border: none; background: #202e40; border-radius: 4px; height: 10px; text-align: center; }
-QProgressBar::chunk { background: #59ba9d; border-radius: 4px; }
-QScrollArea { border: none; background: transparent; }
-QScrollBar:horizontal { height: 10px; background: #172231; }
-QScrollBar::handle:horizontal { background: #42566f; min-width: 25px; border-radius: 4px; }
-QScrollBar:vertical { width: 10px; background: #172231; }
-QScrollBar::handle:vertical { background: #42566f; min-height: 25px; border-radius: 4px; }
-QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; background: transparent; }
-QTabWidget::pane { border: 1px solid #283548; background: #171f2b; border-radius: 6px; }
-QTabBar::tab { background: #202b3a; padding: 7px 12px; }
-QTabBar::tab:selected { background: #31534f; color: #b8ffe7; }
-QWidget#layerProperties, QWidget#effectsPanel { background: #171f2b; }
-QSplitter::handle { background: #263246; }
-QToolTip { background: #25374b; color: #e6f2ff; border: 1px solid #52708e; }
-'''
+from .ui_theme import InteractionFeedback, STYLE
 
 
 def button(text, callback, primary=False):
@@ -108,7 +68,7 @@ class PreviewDialog(QDialog):
         self.player.setLoops(QMediaPlayer.Loops.Infinite)
         self.progress = PreviewProgress(spans)
         self.progress.setEnabled(False)
-        self.position_label = label('')
+        self.position_label = label('', 'timecode')
         self._resume_after_scrub = False
         self._scrub_timer = QTimer(self)
         self._scrub_timer.setSingleShot(True)
@@ -198,6 +158,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.resize(1390, 960)
         self.setMinimumSize(1040, 760)
         self.setStyleSheet(STYLE)
+        self.feedback = InteractionFeedback(self)
         self.components = ComponentManager()
         self.project = None
         self.info = None
@@ -237,13 +198,19 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(22, 18, 22, 16)
-        layout.setSpacing(12)
-        header = QHBoxLayout()
-        header.addWidget(label('Q-PIXELATE', 'brand'))
-        header.addWidget(label('  局部修订 · 快速缝合'))
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(9)
+        masthead = QFrame()
+        masthead.setObjectName('masthead')
+        header = QHBoxLayout(masthead)
+        header.setContentsMargins(13, 9, 13, 9)
+        signature = QVBoxLayout()
+        signature.setSpacing(0)
+        signature.addWidget(label('Q-PIXELATE', 'brand'))
+        signature.addWidget(label('局部修订 · 快速缝合', 'tagline'))
+        header.addLayout(signature)
         header.addStretch()
-        self.open_button = button('打开视频', self.choose_video)
+        self.open_button = button('打开视频', self.choose_video, True)
         self.load_button = button('载入工程', self.choose_project)
         self.save_button = button('保存工程', self.save_project)
         self.library_button = button('贴纸素材', self.show_sticker_library)
@@ -253,30 +220,39 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         for widget in (self.open_button, self.load_button, self.save_button, self.library_button,
                        self.settings_button, self.export_button):
             header.addWidget(widget)
-        layout.addLayout(header)
-        self.source_label = label('选择源视频；文件全程在本机处理。')
+        layout.addWidget(masthead)
+        self.source_label = label('选择源视频。文件全程在本机处理。', 'source')
         self.source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.source_label)
         self.body = QWidget()
         body = QVBoxLayout(self.body)
         body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(6)
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(8)
         body.addWidget(splitter, 1)
         preview_panel = QFrame()
         preview_panel.setObjectName('panel')
         preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(10, 9, 10, 9)
+        preview_layout.setSpacing(7)
         self.mode_label = label('将素材库贴纸拖到画面。遮罩轮廓可在画面编辑，实际模糊和羽化可通过效果预览检查。')
         self.mode_label.setWordWrap(True)
         preview_layout.addWidget(self.mode_label)
         self.canvas = VideoCanvas()
+        self.canvas.setMinimumHeight(64)
         preview_layout.addWidget(self.canvas, 1)
         playback = QHBoxLayout()
-        playback.addWidget(button('◀ 一帧', lambda: self.step_frame(-1)))
-        playback.addWidget(button('− N 秒', lambda: self.skip_seconds(-1)))
-        self.play_button = button('▶ 播放', self.toggle_play)
+        self.back_frame_button = button('◀ 一帧', lambda: self.step_frame(-1))
+        self.back_seconds_button = button('− N 秒', lambda: self.skip_seconds(-1))
+        playback.addWidget(self.back_frame_button)
+        playback.addWidget(self.back_seconds_button)
+        self.play_button = button('▶ 播放', self.toggle_play, True)
         playback.addWidget(self.play_button)
-        playback.addWidget(button('一帧 ▶', lambda: self.step_frame(1)))
-        playback.addWidget(button('＋ N 秒', lambda: self.skip_seconds(1)))
+        self.next_frame_button = button('一帧 ▶', lambda: self.step_frame(1))
+        self.next_seconds_button = button('＋ N 秒', lambda: self.skip_seconds(1))
+        playback.addWidget(self.next_frame_button)
+        playback.addWidget(self.next_seconds_button)
         self.seek_seconds = ParamControl()
         self.seek_seconds.setRange(.1, 600)
         self.seek_seconds.setValue(5)
@@ -290,8 +266,9 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             widget.pressed.connect(lambda d=direction: self.start_shuttle(d))
             widget.released.connect(self.stop_shuttle)
             shuttle_controls.addWidget(widget)
-        self.position_label = label('00:00:00.000 / 00:00:00.000')
-        playback.addStretch()
+        self.position_label = label('00:00:00.000 / 00:00:00.000', 'timecode')
+        for index in range(5):
+            playback.setStretch(index, 1)
         preview_layout.addLayout(playback)
         shuttle_controls.addStretch()
         shuttle_controls.addWidget(self.position_label)
@@ -301,16 +278,18 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         side.setObjectName('panel')
         side.setMinimumWidth(350)
         side_layout = QVBoxLayout(side)
-        side_layout.setSpacing(9)
+        side_layout.setSpacing(6)
         title = QHBoxLayout()
-        title.addWidget(label('随时添加选区', 'section'))
+        title.addWidget(label('选区列表', 'clipHeading'), 0, Qt.AlignmentFlag.AlignVCenter)
         title.addStretch()
-        self.count_label = label('0 段')
-        title.addWidget(self.count_label)
+        self.count_label = label('0 段', 'count')
+        title.addWidget(self.count_label, 0, Qt.AlignmentFlag.AlignVCenter)
         side_layout.addLayout(title)
         self.clip_list = QListWidget()
+        self.clip_list.setObjectName('clipList')
+        self.clip_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         self.clip_list.setMinimumHeight(100)
-        self.clip_list.setMaximumHeight(140)
+        self.clip_list.setAlternatingRowColors(True)
         self.clip_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.clip_list.setToolTip('Ctrl 加选或取消，Shift 连选。')
         self.clip_list.itemSelectionChanged.connect(self.sync_clip_selection)
@@ -335,7 +314,8 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         side_layout.addWidget(self.workflow_label)
         form = QFormLayout()
         self.clip_form = form
-        form.setSpacing(9)
+        form.setHorizontalSpacing(9)
+        form.setVerticalSpacing(5)
         self.in_time = ParamControl(time=True)
         self.out_time = ParamControl(time=True)
         form.addRow('入点', self.in_time)
@@ -405,9 +385,11 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.image_label = label('尚未选择贴纸')
         self.image_label.setWordWrap(True)
         side_layout.addWidget(self.image_label)
-        actions_panel = QWidget()
+        actions_panel = QFrame()
+        actions_panel.setObjectName('editorActions')
         actions_layout = QVBoxLayout(actions_panel)
-        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setContentsMargins(7, 7, 7, 7)
+        actions_layout.setSpacing(6)
         row = QHBoxLayout()
         self.confirm_button = button('确认修改', self.apply_edit, True)
         self.unlock_button = button('解锁旧片段', self.unlock_edit)
@@ -429,6 +411,8 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.editor_tabs.addTab(scroll, '选择区间')
         self.editor_tabs.addTab(self.setup_effects_tab(), '添加效果')
         self.editor_tabs.addTab(self.layer_properties_tab, '图层属性')
+        tabs = self.editor_tabs.tabBar()
+        self.editor_tabs.currentChanged.connect(lambda index: self.feedback.play(tabs, tabs.tabRect(index)))
         editor_panel = QWidget()
         editor_panel.setMinimumWidth(375)
         editor_layout = QVBoxLayout(editor_panel)
@@ -437,15 +421,19 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         editor_layout.addWidget(actions_panel)
         splitter.addWidget(editor_panel)
         splitter.setSizes([950, 380])
-        timeline_header = QHBoxLayout()
+        timeline_tools = QFrame()
+        timeline_tools.setObjectName('timelineHeader')
+        timeline_header = QHBoxLayout(timeline_tools)
+        timeline_header.setContentsMargins(9, 5, 9, 5)
         timeline_header.addWidget(label('源视频时间轴', 'section'))
-        timeline_header.addWidget(label('  I / O 设入出点 · Ctrl+L 锁定长度 · 空格播放 / 暂停'))
+        timeline_header.addWidget(label('I / O 设入出点 · Ctrl+L 锁定长度 · 空格播放 / 暂停'))
         timeline_header.addStretch()
         clip_choices = QPushButton('选区操作')
         clip_menu = QMenu(clip_choices)
         clip_menu.addAction('选择全部已有选区', self.select_all_clips)
         clip_menu.addAction('反选已有选区', self.invert_clip_selection)
         clip_menu.addAction('为剩余片段创建选区并选中', self.select_uncovered_ranges)
+        clip_menu.triggered.connect(lambda _: self.feedback.play(clip_choices))
         clip_choices.setMenu(clip_menu)
         timeline_header.addWidget(clip_choices)
         self.in_button = button('设为入点 I', self.set_in)
@@ -457,7 +445,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.zoom.setRange(1, 100)
         self.zoom.setMaximumWidth(240)
         timeline_header.addWidget(self.zoom)
-        body.addLayout(timeline_header)
+        body.addWidget(timeline_tools)
         self.timeline = Timeline()
         body.addWidget(self.timeline)
         layer_scroll = QScrollArea()
@@ -481,7 +469,10 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         self.timeline.editDragged.connect(self.drag_selection)
         self.timeline.rangeCreated.connect(self.create_ranges)
         layout.addWidget(self.body, 1)
-        footer = QHBoxLayout()
+        footer_panel = QFrame()
+        footer_panel.setObjectName('footer')
+        footer = QHBoxLayout(footer_panel)
+        footer.setContentsMargins(9, 5, 6, 5)
         self.status = label('就绪 · 首版快速导出优先支持 H.264 / SDR / 固定帧率录屏')
         self.status.setWordWrap(True)
         footer.addWidget(self.status, 1)
@@ -493,11 +484,14 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         footer.addWidget(self.folder_button)
         log_button = button('处理日志', self.toggle_logs)
         footer.addWidget(log_button)
-        layout.addLayout(footer)
+        layout.addWidget(footer_panel)
         self.progress = QProgressBar()
+        self.progress.setProperty('feedbackPanel', True)
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
         self.logs = QTextEdit()
+        self.logs.setObjectName('logs')
+        self.logs.setProperty('feedbackPanel', True)
         self.logs.setReadOnly(True)
         self.logs.document().setMaximumBlockCount(1500)
         self.logs.setMaximumHeight(160)
@@ -560,6 +554,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         row.addWidget(speed, 1)
         layout.addLayout(row)
         self.setup_detection_panel()
+        self.detection_tab.setProperty('feedbackPanel', True)
         layout.addWidget(self.detection_tab)
         self.detection_tab.hide()
         layout.addStretch()
@@ -690,6 +685,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
         worker = self.worker
         self.worker = None
         self.update_enabled()
+        self.feedback.play(self.status)
         if worker:
             worker.deleteLater()
         if self._closing:
@@ -1594,6 +1590,15 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
     def keyPressEvent(self, event):
         super().keyPressEvent(event)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.feedback.start()
+        QApplication.instance().installEventFilter(self)
+
+    def hideEvent(self, event):
+        self.feedback.stop()
+        super().hideEvent(event)
+
     def eventFilter(self, obj, event):
         if event.type() in (QEvent.Type.WindowDeactivate, QEvent.Type.ApplicationDeactivate) and (obj is self or obj is QApplication.instance()):
             self.stop_shuttle()
@@ -1613,13 +1618,16 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             if key == Qt.Key_L and event.modifiers() == Qt.ControlModifier:
                 if not event.isAutoRepeat():
                     self.toggle_range_lock()
+                    self.feedback.play(self.range_button)
                 return True
             if key == Qt.Key_T and event.modifiers() == Qt.ControlModifier and self.begin_transform():
+                self.feedback.play(self.mode_label)
                 return True
             if focus is self.canvas and key == Qt.Key_Escape and self.canvas.mask_shape is not None:
                 self.cancel_layer_interaction()
                 self.update_canvas_mask()
                 self.status.setText('已取消绘制遮罩。')
+                self.feedback.play(self.status)
                 return True
             if self.canvas.free_transform and key in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter):
                 geometry_focus = next((spin for spin in self.layer_panel.geometry
@@ -1628,6 +1636,7 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
                     if geometry_focus and key != Qt.Key_Escape:
                         geometry_focus.interpretText()
                     self.finish_transform(key == Qt.Key_Escape)
+                    self.feedback.play(self.mode_label)
                     return True
         if isinstance(focus, (QLineEdit, QAbstractSpinBox, QTextEdit, QComboBox, ParamControl)) or (
                 focus and isinstance(focus.parentWidget(), ParamControl)):
@@ -1640,31 +1649,39 @@ class MainWindow(QMainWindow, LayerEditing, AutomaticMosaic):
             if key == Qt.Key_Space:
                 self.stop_shuttle()
                 self.toggle_play()
+                self.feedback.play(self.play_button)
             elif key in (Qt.Key_Left, Qt.Key_Right):
                 direction = -1 if key == Qt.Key_Left else 1
                 if event.modifiers() & Qt.ShiftModifier:
                     self.skip_seconds(direction)
+                    self.feedback.play(self.back_seconds_button if direction < 0 else self.next_seconds_button)
                 else:
                     self.stop_shuttle()
                     self.step_frame(direction)
+                    self.feedback.play(self.back_frame_button if direction < 0 else self.next_frame_button)
                     self._arrow_key = key
                     self.hold_timer.start()
             elif key == Qt.Key_I:
                 self.set_in()
+                self.feedback.play(self.in_button)
             elif key == Qt.Key_O:
                 self.set_out()
+                self.feedback.play(self.out_button)
             elif key == Qt.Key_Delete:
                 in_layers = focus in (self.canvas, self.layer_timeline) or (
                     focus is not None and self.layer_panel.isAncestorOf(focus))
                 if in_layers and self.layer_edit() is not None:
                     self.delete_layer()
+                    self.feedback.play(self.layer_panel)
                 elif focus in (self.clip_list, self.timeline):
                     self.delete_edit()
+                    self.feedback.play(self.clip_list)
         return True
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() and not self.worker:
             event.acceptProposedAction()
+            self.feedback.play(self.source_label)
 
     def dropEvent(self, event):
         urls = event.mimeData().urls()

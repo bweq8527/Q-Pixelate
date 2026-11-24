@@ -6,9 +6,11 @@ from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QValidator
 from PySide6.QtWidgets import QDoubleSpinBox, QWidget
 
+from .gesture_feedback import GestureFeedback, tint
 from .model import Mask, Rect, Transform
 from .masks import layer_mask_path, mask_path, paint_sticker, transform_geometry
 from .stickers import STICKER_MIME
+from .palette import BLUR_TONE, BRICK, CANVAS, INK, MUSTARD, MUTED, PAPER, STICKER_TONE, SURFACE, TEAL_WASH
 
 
 def time_text(seconds):
@@ -87,6 +89,9 @@ class VideoCanvas(QWidget):
         self.mask_shape = None
         self.mask_stroke = []
         self.sticker_images = {}
+        self._feedback = GestureFeedback(self)
+        self._drop_target = False
+        self._hover_canvas = False
 
     def redraw(self):
         self.draw_new = True
@@ -128,26 +133,63 @@ class VideoCanvas(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rectGeometry(), QColor('#0a0c10'))
+        p.fillRect(self.rectGeometry(), QColor(CANVAS))
         box = self.video_rect()
         if not self.image.isNull():
             p.drawImage(box, self.image)
         else:
-            p.setPen(QColor('#69768b'))
-            p.drawText(self.rectGeometry(), Qt.AlignmentFlag.AlignCenter, '打开视频，开始局部修订\n\nMP4 / MKV · 本地处理')
+            self.paint_empty_canvas(p)
         if self.show_mask:
             mask = self.mask_rect()
             path = mask_path('rect' if self.fullscreen_mask else self.shape,
                              Rect(0, 0, 1, 1) if self.fullscreen_mask else self.rect, self.points, box)
-            p.fillPath(path, QColor(94, 196, 175, 35))
-            p.setPen(QPen(QColor('#6ee7c0'), 2, Qt.PenStyle.DashLine))
+            p.fillPath(path, tint(MUSTARD, 50 if self.anchor is not None else 24))
+            p.setPen(QPen(QColor(INK), 4))
+            p.drawPath(path)
+            p.setPen(QPen(QColor(MUSTARD), 2, Qt.PenStyle.DashLine))
             p.drawPath(path)
             if not self.fullscreen_mask and self.shape != 'lasso':
-                p.fillRect(QRectF(mask.bottomRight()-QPointF(5, 5), mask.bottomRight()+QPointF(5, 5)), QColor('#6ee7c0'))
-            p.setPen(QColor('#b5f5df'))
-            p.drawText(box.adjusted(12, 12, -12, -12), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
-                       self.effect_label or '编辑区域 · 拖动画框，内部移动，右下角缩放')
+                handle = QRectF(mask.bottomRight()-QPointF(5, 5), mask.bottomRight()+QPointF(5, 5))
+                p.fillRect(handle, QColor(INK))
+                p.fillRect(handle.adjusted(2, 2, -2, -2), QColor(MUSTARD))
+            self.paint_mask_label(p, box)
         self.paint_layers(p, box)
+        if self._drop_target:
+            p.setPen(QPen(QColor(INK), 6))
+            p.drawRect(box.adjusted(3, 3, -3, -3))
+            p.setPen(QPen(QColor(MUSTARD), 3))
+            p.drawRect(box.adjusted(3, 3, -3, -3))
+        self._feedback.paint(p)
+
+    def paint_empty_canvas(self, painter):
+        painter.save()
+        center_y = self.height() / 2
+        painter.fillRect(QRectF(self.width()/2-23, center_y-33, 46, 4), QColor(MUSTARD))
+        heading = painter.font()
+        heading.setPixelSize(18)
+        heading.setBold(True)
+        painter.setFont(heading)
+        painter.setPen(QColor(SURFACE))
+        painter.drawText(QRectF(8, center_y-22, self.width()-16, 28),
+                         Qt.AlignmentFlag.AlignCenter, '打开视频，开始局部修订')
+        caption = painter.font()
+        caption.setPixelSize(12)
+        caption.setBold(False)
+        painter.setFont(caption)
+        painter.setPen(QColor('#C3BFAE'))
+        painter.drawText(QRectF(8, center_y+9, self.width()-16, 20),
+                         Qt.AlignmentFlag.AlignCenter, 'MP4 / MKV · 本地处理')
+        painter.restore()
+
+    def paint_mask_label(self, painter, box):
+        caption = self.effect_label or '编辑区域 · 拖动画框，内部移动，右下角缩放'
+        metrics = painter.fontMetrics()
+        caption = metrics.elidedText(caption, Qt.TextElideMode.ElideRight, max(0, int(box.width())-40))
+        badge = QRectF(box.left()+12, box.top()+12, metrics.horizontalAdvance(caption)+16, metrics.height()+8)
+        painter.fillRect(badge.translated(3, 3), QColor(INK))
+        painter.fillRect(badge, QColor(MUSTARD))
+        painter.setPen(QColor(INK))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, caption)
 
     def paint_layers(self, painter, box):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -164,15 +206,15 @@ class VideoCanvas(QWidget):
                 rect = layer.mosaic_rect_at(self.layer_source_time-layer.start)
                 area = QRectF(box.x()+rect.x*box.width(), box.y()+rect.y*box.height(),
                               rect.w*box.width(), rect.h*box.height()).intersected(box)
-                painter.fillRect(area, QColor(94, 196, 175, 30))
-                painter.setPen(QPen(QColor('#6ee7c0'), 1, Qt.PenStyle.DashLine))
+                painter.fillRect(area, tint(MUSTARD, 30))
+                painter.setPen(QPen(QColor(MUSTARD), 1, Qt.PenStyle.DashLine))
                 painter.drawRect(area)
             elif layer.mask:
                 painter.save()
                 painter.setClipRect(box)
                 path = layer_mask_path(layer.mask, box)
-                painter.fillPath(path, QColor(94, 196, 175, 30))
-                painter.setPen(QPen(QColor('#6ee7c0'), 1, Qt.PenStyle.DashLine))
+                painter.fillPath(path, tint(MUSTARD, 30))
+                painter.setPen(QPen(QColor(MUSTARD), 1, Qt.PenStyle.DashLine))
                 painter.drawPath(path)
                 painter.restore()
         for rect in self.detection_boxes:
@@ -181,22 +223,27 @@ class VideoCanvas(QWidget):
             transform, mask = self.layer_target
             matrix, local = transform_geometry(transform, box)
             if mask:
-                painter.setPen(QPen(QColor('#6ee7c0'), 1, Qt.PenStyle.DashLine))
+                painter.setPen(QPen(QColor(MUSTARD), 1, Qt.PenStyle.DashLine))
                 painter.drawPath(layer_mask_path(mask, box))
             painter.save()
             painter.setTransform(matrix, True)
-            painter.setPen(QPen(QColor('#ffe09e'), 1))
+            handle_color = MUSTARD if self.layer_gesture else BRICK
+            painter.setPen(QPen(QColor(INK), 4))
+            painter.drawRect(local)
+            painter.setPen(QPen(QColor(handle_color), 2))
             painter.drawRect(local)
             if self.free_transform:
                 for _, _, handle in self.handles(local):
-                    painter.fillRect(QRectF(handle.x()-4, handle.y()-4, 8, 8), QColor('#ffe09e'))
+                    grip = QRectF(handle.x()-4, handle.y()-4, 8, 8)
+                    painter.fillRect(grip, QColor(INK))
+                    painter.fillRect(grip.adjusted(1, 1, -1, -1), QColor(handle_color))
                 knob = QPointF(0, local.top()-22)
                 painter.drawLine(QPointF(0, local.top()), knob)
-                painter.drawEllipse(knob, 4, 4)
+                painter.fillRect(QRectF(knob.x()-4, knob.y()-4, 8, 8), QColor(handle_color))
             painter.restore()
         if self.mask_stroke:
             points = [QPointF(box.x()+x*box.width(), box.y()+y*box.height()) for x, y in self.mask_stroke]
-            painter.setPen(QPen(QColor('#6ee7c0'), 2, Qt.PenStyle.DashLine))
+            painter.setPen(QPen(QColor(MUSTARD), 2, Qt.PenStyle.DashLine))
             if self.mask_shape == 'lasso':
                 for a, b in zip(points, points[1:]):
                     painter.drawLine(a, b)
@@ -212,8 +259,8 @@ class VideoCanvas(QWidget):
         painter.save()
         painter.setClipRect(box)
         path = mask_path('rect', rect, [], box)
-        painter.fillPath(path, QColor(255, 184, 107, 28))
-        painter.setPen(QPen(QColor('#ffb86b'), 2, Qt.PenStyle.DashLine))
+        painter.fillPath(path, tint(BRICK, 28))
+        painter.setPen(QPen(QColor(BRICK), 2, Qt.PenStyle.DashLine))
         painter.drawPath(path)
         painter.restore()
 
@@ -224,21 +271,37 @@ class VideoCanvas(QWidget):
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat(STICKER_MIME):
+            self._set_drop_target(self.video_rect().contains(event.position()), event.position())
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasFormat(STICKER_MIME) and self.video_rect().contains(event.position()):
+        valid = event.mimeData().hasFormat(STICKER_MIME) and self.video_rect().contains(event.position())
+        self._set_drop_target(valid, event.position())
+        if valid:
             event.acceptProposedAction()
         else:
             event.ignore()
 
+    def dragLeaveEvent(self, event):
+        self._set_drop_target(False)
+        super().dragLeaveEvent(event)
+
+    def _set_drop_target(self, active, position=None):
+        if self._drop_target != active:
+            self._drop_target = active
+            if active:
+                self._feedback.trigger(position)
+            self.update()
+
     def dropEvent(self, event):
+        self._set_drop_target(False)
         if not event.mimeData().hasFormat(STICKER_MIME) or not self.video_rect().contains(event.position()):
             return
         try:
             path = bytes(event.mimeData().data(STICKER_MIME)).decode('utf-8')
         except UnicodeDecodeError:
             return
+        self._feedback.trigger(event.position())
         self.stickerDropped.emit(path, self.normalized_point(event.position()))
         event.acceptProposedAction()
 
@@ -249,6 +312,7 @@ class VideoCanvas(QWidget):
         box = self.video_rect()
         if self.mask_shape is not None:
             if box.contains(position):
+                self._feedback.trigger(position)
                 point = self.normalized_point(position)
                 self.mask_stroke = [(point.x(), point.y())]
                 self.update()
@@ -270,6 +334,8 @@ class VideoCanvas(QWidget):
                 mode = 'move'
             if mode:
                 self.layer_gesture = mode, axes, transform, matrix, local, point
+                self._feedback.trigger(position)
+                self.update()
                 return True
         if not box.contains(position):
             return False
@@ -283,6 +349,7 @@ class VideoCanvas(QWidget):
             else:
                 inside = bool(layer.mask and layer_mask_path(layer.mask, box).contains(position))
             if inside:
+                self._feedback.trigger(position)
                 self.layerPicked.emit(index)
                 return True
         return False
@@ -355,6 +422,7 @@ class VideoCanvas(QWidget):
             return
         if not self.editable or event.button() != Qt.MouseButton.LeftButton or not self.video_rect().contains(event.position()):
             return
+        self._feedback.trigger(event.position())
         self.anchor = self.normalized_point(event.position())
         if self.shape == 'lasso':
             self.points = [(self.anchor.x(), self.anchor.y())]
@@ -371,6 +439,7 @@ class VideoCanvas(QWidget):
             self.drag_mode = 'move'
         else:
             self.drag_mode = 'draw'
+        self.update()
 
     def mouseMoveEvent(self, event):
         if self.layer_gesture:
@@ -380,6 +449,11 @@ class VideoCanvas(QWidget):
             self.update_mask_stroke(event.position())
             return
         if self.anchor is None:
+            interactive = self.editable or self.mask_shape or self.layer_target or self.layers
+            hovered = bool(interactive and self.video_rect().contains(event.position()))
+            if hovered and not self._hover_canvas:
+                self._feedback.trigger(event.position(), BRICK)
+            self._hover_canvas = hovered
             return
         current = self.normalized_point(event.position())
         a, r = self.anchor, self.original_rect
@@ -407,10 +481,13 @@ class VideoCanvas(QWidget):
         if self.layer_gesture:
             self.update_layer_gesture(event)
             self.layer_gesture = None
+            self._feedback.trigger(event.position())
+            self.update()
             return
         if self.mask_stroke:
             self.update_mask_stroke(event.position())
             self.finish_mask_stroke()
+            self._feedback.trigger(event.position())
             return
         if self.anchor is not None:
             self.mouseMoveEvent(event)
@@ -422,8 +499,14 @@ class VideoCanvas(QWidget):
                 self.rect = finished_rect
                 self.rectChanged.emit(self.rect)
             self.draw_new = False
+            self._feedback.trigger(event.position())
+            self.update()
         self.anchor = None
         self.drag_mode = None
+
+    def leaveEvent(self, event):
+        self._hover_canvas = False
+        super().leaveEvent(event)
 
 
 class Timeline(QWidget):
@@ -455,6 +538,8 @@ class Timeline(QWidget):
         self.candidate = None
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
+        self._feedback = GestureFeedback(self)
+        self._hover_lane = None
 
     @property
     def visible(self):
@@ -483,54 +568,70 @@ class Timeline(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), QColor('#131923'))
-        p.fillRect(QRectF(20, 34, self.width()-40, 18), QColor('#2d3546'))
-        p.fillRect(QRectF(20, 60, self.width()-40, 42), QColor('#202b3a'))
+        p.fillRect(self.rect(), QColor(SURFACE))
+        p.setPen(QPen(QColor(INK), 2))
+        for lane, top, height in (('seek', 34, 18), ('edit', 60, 42)):
+            highlighted = self._hover_lane == lane and self.duration
+            if self.drag:
+                highlighted = lane == ('seek' if self.drag in ('seek', 'pan') else 'edit')
+            p.setBrush(QColor(TEAL_WASH if highlighted else PAPER))
+            p.drawRect(QRectF(20, top, self.width()-40, height))
         if not self.duration:
             return
         steps = [0.1, .2, .5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1800, 3600, 10800]
         target = self.visible/max(2, self.width()/100)
         step = next((s for s in steps if s >= target), steps[-1])
         t = math.ceil(self.view_start/step)*step
-        p.setFont(QFont('Segoe UI', 9))
+        p.setFont(QFont('Consolas', 9))
         while t <= self.view_start+self.visible:
             x = self.point_for_time(t).x()
-            p.setPen(QColor('#526078'))
-            p.drawLine(x, 39, x, 102)
-            p.setPen(QColor('#99a8be'))
+            p.setPen(QColor(MUTED))
+            p.drawLine(x, 39, x, 49)
+            p.drawLine(x, 61, x, 101)
             caption = time_text(t).split('.')[0] if step >= 1 else time_text(t)
             if x+4+p.fontMetrics().horizontalAdvance(caption) <= self.width()-12:
                 p.drawText(x+4, 25, caption)
             t += step
-        p.setClipRect(19, 42, self.width()-38, 62)
+        p.setClipRect(19, 57, self.width()-38, 47)
         for row, edit in enumerate(self.edits):
             x1, x2 = self.point_for_time(edit.start).x(), self.point_for_time(edit.end).x()
-            color = QColor('#815054') if edit.omit else QColor('#415568') if edit.locked else (
-                QColor('#296f69') if edit.effect != 'image' else QColor('#7460a0'))
-            p.fillRect(QRectF(x1, 58, max(2, x2-x1), 34), color)
+            color = BRICK if edit.omit else '#AAA598' if edit.locked else (
+                BLUR_TONE if edit.effect != 'image' else STICKER_TONE)
+            block = QRectF(x1, 63, max(2, x2-x1), 29)
+            p.fillRect(block, QColor(color))
+            p.setPen(QPen(QColor(INK), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(block)
             if row in self.selected_rows and row != self.active_row:
-                p.setPen(QPen(QColor('#6ee7c0'), 1))
+                p.setPen(QPen(QColor(INK), 1, Qt.PenStyle.DashLine))
                 p.drawRect(QRectF(x1, 60, max(2, x2-x1), 42))
         first, last = self.candidate or self.selection
         left, right = self.point_for_time(first).x(), self.point_for_time(last).x()
         if first < last or self.candidate:
             outline = QRectF(left, 60, max(2, right-left), 42)
-            p.fillRect(outline, QColor(110, 231, 192, 28))
-            p.setPen(QPen(QColor('#6ee7c0'), 2))
+            p.fillRect(outline, tint(MUSTARD, 104 if self.candidate else 50))
+            p.setPen(QPen(QColor(INK), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(outline)
             if not self.selection_locked or self.candidate:
                 for x in (left, right):
-                    p.fillRect(QRectF(x-3, 60, 6, 42), QColor('#6ee7c0'))
+                    p.fillRect(QRectF(x-3, 60, 6, 42), QColor(INK))
+                    p.fillRect(QRectF(x-1, 64, 2, 34), QColor(MUSTARD))
         for start, end in self.detection_spans:
             x1, x2 = self.point_for_time(start).x(), self.point_for_time(end).x()
-            p.fillRect(QRectF(x1, 96, max(2, x2-x1), 4), QColor('#ffb86b'))
+            p.fillRect(QRectF(x1, 96, max(2, x2-x1), 4), QColor(BRICK))
+        p.setClipping(False)
+        p.setClipRect(15, 28, self.width()-30, 27)
         x = self.point_for_time(self.position).x()
-        p.setPen(QPen(QColor('#ffb86b'), 2))
+        p.setPen(QPen(QColor(INK), 3))
         p.drawLine(x, 34, x, 52)
+        p.setBrush(QColor(MUSTARD if self.drag == 'seek' else BRICK))
+        p.drawRect(QRectF(x-4, 32, 8, 10))
         p.setClipping(False)
-        p.setPen(QColor('#9aacc2'))
-        p.drawText(20, 115, '上轨：播放定位    下轨：右键拖出选区 · Ctrl 加选 · Shift 连选    中键 / Alt 拖动：平移')
-        p.setClipping(False)
+        p.setFont(self.font())
+        p.setPen(QColor(MUTED))
+        p.drawText(20, 113, '上轨：播放定位    下轨：右键拖出选区 · Ctrl 加选 · Shift 连选    中键 / Alt 拖动：平移')
+        self._feedback.paint(p)
 
     def mousePressEvent(self, event):
         if not self.duration:
@@ -543,6 +644,8 @@ class Timeline(QWidget):
             self.drag_button = button
             self.pan_x = x
             self.pan_start = self.view_start
+            self._feedback.trigger(event.position(), BRICK)
+            self.update()
             return
         if not 19 <= x <= self.width()-19:
             return
@@ -550,6 +653,8 @@ class Timeline(QWidget):
         self.drag_button = button
         if 34 <= y <= 52 and button == Qt.MouseButton.LeftButton:
             self.drag = 'seek'
+            self._feedback.trigger(event.position(), BRICK)
+            self.update()
             self.seekRequested.emit(self.anchor)
             return
         if not 58 <= y <= 102:
@@ -557,12 +662,15 @@ class Timeline(QWidget):
         if button == Qt.MouseButton.RightButton:
             self.drag = 'create'
             self.candidate = (self.anchor, self.anchor)
+            self._feedback.trigger(event.position())
             self.update()
             return
         if button != Qt.MouseButton.LeftButton:
             return
         if not self.edits and not self.selection_locked and event.modifiers() & Qt.ShiftModifier:
             self.drag = 'range'
+            self._feedback.trigger(event.position())
+            self.update()
             return
         ranges = [(e.start, e.end) for e in self.edits] or [self.selection]
         edges, interiors = [], []
@@ -585,6 +693,7 @@ class Timeline(QWidget):
             return
         a, b = ranges[index]
         lo, hi = 0, self.duration
+        self._feedback.trigger(event.position())
         if self.edits:
             modifiers = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
             if modifiers:
@@ -601,9 +710,16 @@ class Timeline(QWidget):
         self.drag = mode
         self.drag_row = index if self.edits else -1
         self.drag_bounds = (a, b, lo, hi)
+        self.update()
 
     def mouseMoveEvent(self, event):
         if not self.drag:
+            lane = self._lane_at(event.position())
+            if self._hover_lane != lane:
+                self._hover_lane = lane
+                if lane:
+                    self._feedback.trigger(event.position(), BRICK)
+                self.update()
             return
         if self.drag == 'pan':
             self.set_view_start(self.pan_start + (self.pan_x-event.position().x())/max(1, self.width()-40)*self.visible)
@@ -630,6 +746,20 @@ class Timeline(QWidget):
             self.candidate = (a, b)
         self.update()
 
+    def leaveEvent(self, event):
+        self._hover_lane = None
+        self.update()
+        super().leaveEvent(event)
+
+    def _lane_at(self, position):
+        x, y = position.x(), position.y()
+        if self.duration and 19 <= x <= self.width()-19:
+            if 34 <= y <= 52:
+                return 'seek'
+            if 58 <= y <= 102:
+                return 'edit'
+        return None
+
     def mouseReleaseEvent(self, event):
         if not self.drag or event.button() != self.drag_button:
             return
@@ -637,6 +767,8 @@ class Timeline(QWidget):
         mode, candidate = self.drag, self.candidate
         self.drag = None
         self.candidate = None
+        self._hover_lane = self._lane_at(event.position())
+        self._feedback.trigger(event.position(), BRICK if mode in ('seek', 'pan') else MUSTARD)
         if mode == 'create':
             self.rangeCreated.emit(*candidate)
         elif mode in ('left', 'right', 'move') and candidate != self.drag_bounds[:2]:
@@ -652,6 +784,7 @@ class Timeline(QWidget):
         if self.duration and delta:
             zoom = self.zoom*(1.3 if delta > 0 else 1/1.3)
             self.set_zoom(max(1, min(100, zoom)), anchor_x=event.position().x())
+            self._feedback.trigger(event.position(), BRICK)
 
     def set_view_start(self, value):
         self.view_start = max(0, min(self.duration-self.visible, value))

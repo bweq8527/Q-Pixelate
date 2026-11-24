@@ -99,6 +99,7 @@ class ComponentDialog(QDialog):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.progress = QProgressBar()
+        self.progress.setProperty('feedbackPanel', True)
         self.progress.hide()
         layout.addWidget(self.progress)
         row = QHBoxLayout()

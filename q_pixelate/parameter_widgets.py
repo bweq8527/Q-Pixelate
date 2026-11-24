@@ -55,7 +55,7 @@ class ParamControl(QWidget):
         for button in (self.decrease, self.increase):
             button.setAutoDefault(False)
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-            button.setStyleSheet('padding: 4px 5px;')
+            button.setObjectName('parameterStep')
             layout.addWidget(button)
 
         self.slider.valueChanged.connect(lambda tick: self._set_tick(tick, user=True))

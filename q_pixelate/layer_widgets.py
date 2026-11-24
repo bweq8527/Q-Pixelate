@@ -5,9 +5,14 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
 )
 
+from .gesture_feedback import GestureFeedback, tint
 from .model import AUDIO_TRANSITIONS, VIDEO_TRANSITIONS
 from .parameter_widgets import ParamControl, WheelSafeComboBox
 from .stickers import STICKER_MIME
+from .palette import (
+    BLUR_TONE, BRICK, BRICK_WASH, INK, MOSAIC_TONE, MUSTARD, MUTED, PAPER, SPEED_TONE,
+    STICKER_TONE, SURFACE, TEAL_WASH,
+)
 
 
 OMIT_LAYER = '@omit'
@@ -177,7 +182,10 @@ class LayerTimeline(QWidget):
         self.drag = None
         self.candidate = None
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
         self.setToolTip('拖动图层内部移动时间，拖动两端调整时长')
+        self._feedback = GestureFeedback(self)
+        self._hover_row = -1
 
     def set_edit(self, edit, selected):
         self.edit, self.selected = edit, selected
@@ -186,10 +194,10 @@ class LayerTimeline(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor('#131923'))
+        painter.fillRect(self.rect(), QColor(SURFACE))
         rows = effect_rows(self.edit)
         if not rows:
-            painter.setPen(QColor('#9aacc2'))
+            painter.setPen(QColor(MUTED))
             painter.drawText(20, 17, '图层轨 · 将贴纸拖入画面，或绘制遮罩')
             return
         for index in range(max(0, event.rect().top()//self.row_height),
@@ -197,12 +205,16 @@ class LayerTimeline(QWidget):
             layer = self.edit.layers[index] if index < len(self.edit.layers) else None
             layer_id, title = rows[index]
             selected = index in self.selected
+            dragging = self.drag and self.drag[0] == index
             y = index*self.row_height
             area = QRectF(20, y+2, self.width()-39, self.row_height-3)
-            painter.fillRect(area, QColor('#29394e' if selected else '#202b3a'))
+            highlighted = selected or index == self._hover_row
+            painter.fillRect(area, QColor(TEAL_WASH if highlighted else PAPER))
+            painter.setPen(QPen(QColor(INK), 1))
+            painter.drawRect(area)
             painter.save()
             painter.setClipRect(area)
-            if self.drag and self.drag[0] == index:
+            if dragging:
                 start, end = self.candidate
             elif layer:
                 start, end = self.edit.layer_span(layer)
@@ -211,19 +223,24 @@ class LayerTimeline(QWidget):
             if start < end:
                 left, right = (self.timeline.point_for_time(t).x() for t in (start, end))
                 kind = layer.kind if layer else layer_id
-                color = QColor({'sticker': '#7864a6', 'mosaic': '#93664c', OMIT_LAYER: '#994459',
-                                SPEED_LAYER: '#345b9a'}.get(kind, '#317569'))
-                painter.fillRect(QRectF(left, y+3, max(2, right-left), self.row_height-5), color)
-                if selected:
-                    painter.setPen(QPen(QColor('#d5fff1'), 1))
-                    painter.drawRect(QRectF(left, y+3, max(2, right-left), self.row_height-5))
-            painter.setPen(QColor('#e5edf8'))
+                color = {'sticker': STICKER_TONE, 'mosaic': MOSAIC_TONE, OMIT_LAYER: BRICK_WASH,
+                         SPEED_LAYER: SPEED_TONE}.get(kind, BLUR_TONE)
+                segment = QRectF(left, y+3, max(2, right-left), self.row_height-5)
+                painter.fillRect(segment, QColor(MUSTARD if dragging else color))
+                painter.setPen(QPen(QColor(INK), 2 if selected else 1))
+                painter.drawRect(segment)
+                if selected and layer and not self.edit.locked and right-left > 12:
+                    for x in (left, right-3):
+                        painter.fillRect(QRectF(x, y+5, 3, self.row_height-9), QColor(INK))
+            painter.setPen(QColor(INK if start < end else MUTED))
             painter.drawText(26, y+17, f'{index+1:02}  {title}' + (' · 范围外' if start >= end else ''))
             painter.restore()
         x = self.timeline.point_for_time(self.timeline.position).x()
         if 20 <= x <= self.width()-19:
-            painter.setPen(QPen(QColor('#ffb86b'), 1, Qt.PenStyle.DotLine))
+            painter.setPen(QPen(tint(INK, 170), 1, Qt.PenStyle.DotLine))
             painter.drawLine(x, 0, x, len(rows)*self.row_height)
+            painter.fillRect(QRectF(x-2, 0, 4, 4), QColor(BRICK))
+        self._feedback.paint(painter)
 
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton or not self.edit:
@@ -232,6 +249,7 @@ class LayerTimeline(QWidget):
         if not 0 <= index < len(effect_rows(self.edit)):
             return
         self.setFocus()
+        self._feedback.trigger(event.position())
         modifiers = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
         if modifiers:
             self.selectionModified.emit(index, modifiers)
@@ -255,9 +273,16 @@ class LayerTimeline(QWidget):
             return
         self.drag = (index, mode, self.timeline.time_at(x), a, b)
         self.candidate = (a, b)
+        self.update()
 
     def mouseMoveEvent(self, event):
         if not self.drag:
+            index = self._row_at(event.position())
+            if self._hover_row != index:
+                self._hover_row = index
+                if index >= 0:
+                    self._feedback.trigger(event.position(), BRICK)
+                self.update()
             return
         _, mode, anchor, a, b = self.drag
         delta = self.timeline.time_at(event.position().x())-anchor
@@ -273,6 +298,17 @@ class LayerTimeline(QWidget):
         self.candidate = a, b
         self.update()
 
+    def leaveEvent(self, event):
+        self._hover_row = -1
+        self.update()
+        super().leaveEvent(event)
+
+    def _row_at(self, position):
+        index = int(position.y())//self.row_height
+        if self.rect().contains(position.toPoint()) and 0 <= index < len(effect_rows(self.edit)):
+            return index
+        return -1
+
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.LeftButton or not self.drag:
             return
@@ -280,6 +316,8 @@ class LayerTimeline(QWidget):
         index, _, _, a, b = self.drag
         candidate = self.candidate
         self.drag = self.candidate = None
+        self._hover_row = self._row_at(event.position())
+        self._feedback.trigger(event.position())
         if candidate != (a, b):
             self.dragged.emit(index, *candidate)
         self.update()
